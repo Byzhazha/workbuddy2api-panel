@@ -241,7 +241,7 @@ CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git
 ```bash
 # 1. 准备配置与数据目录
 mkdir -p auths data && cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+#    默认 api_key 为 test_key，可按需编辑 config.json
 
 # 2. 拉取并运行
 docker run -d --name workbuddy2api \
@@ -268,7 +268,7 @@ cd workbuddy2api-panel
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
 cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+#    默认 api_key 为 test_key，可按需编辑 config.json
 
 # 3. 启动（首次会构建镜像，约 1-2 分钟）
 docker compose up -d --build
@@ -560,6 +560,14 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | 猫猫旅行 | `schedule.travel_enabled` | `travel_hours` `[9, 21]` 整点 | 独立排程：无猫领养 / `idle` 派出 / `arrived` 领奖 |
 | 保活 | `schedule.keepalive_enabled` | `keepalive_hours` `[22]` 整点 | 全账号刷新 token；session 失效**连续 3 次**才自动禁用 |
 | 夜猫子 | `schedule.blackcat_enabled` | `blackcat_hours` `[23]` 整点 | **先查任务进度再决定**：`black_cat` 未达标才在 23:00–08:00 计数窗口内补足 glm-5.2 短对话（每天 1 次累计 3 天，漏跑次日窗口自动补） |
+
+#### 启动即补跑签到（关机 / 重启兜底）
+
+排程只在**进程活着**时有效：`nextFire` 严格取「现在之后」的最近整点，进程在 09:00 没在跑（关机 / 重启 / 被杀），这个时点就**永久错过**，启动后主循环只从「现在」往后排、不会回头补。
+
+- **睡眠 / 休眠不用管**：`waitSlot` 按墙钟分段等待，唤醒瞬间发现已过点会立即补跑（带 5s 网络宽限，issue #152）。
+- **关机才需要兜底**：启动时若「今天已有签到时点过去」且「仍有账号今天没签」，立刻补一次签到（含余额查询解冻 + 末尾连登管家）。三道门控让它近乎零成本：`checkin_enabled=false` 整段不跑 / 今天还没有过点（如 08:00 启动）不跑 / 逐号按 `last_checkin_day` 判重，今天已签的号跳过。日志会打一行 `checkin 启动补跑：今天的 09:00 时点已错过，N 个账号待补签`。
+- 局限：**整天没开机**仍会漏签——要彻底解决只能把服务跑在常开的机器上（NAS / 小主机 / VPS 跑 compose），或配 BIOS RTC 定时开机。同理，活跃上报 / 猫猫旅行 / 保活这三类目前**只补签到**，未做启动补跑。
 
 #### 禁用账号与保号任务（`schedule.include_disabled_in_tasks`）
 
@@ -880,7 +888,7 @@ http://127.0.0.1:7863/panel/
 
 - **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `scripts/probe_active.py`）
 - 以 `app` 用户（uid 10001）运行，`app/auths` 与 `app/data` 预建
-- 镜像内默认落 `config.example.json` 作为空配置（不含密钥），生产用挂载卷覆盖 `/app/config.json`
+- 镜像内使用 `config.example.json` 作为默认配置，`api_key` 固定为 `test_key`；面板登录和 API 请求均使用该密钥。可挂载自定义配置覆盖 `/app/config.json`
 - 内置 `HEALTHCHECK`（`wget /healthz`，30s 间隔）
 
 账号 / 数据通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`、`./config.json`。

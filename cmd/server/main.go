@@ -356,6 +356,11 @@ func main() {
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
+	// 启动即补跑签到：排程只从「现在」往后排，关机 / 重启期间过去的时点不会回头补
+	// （睡眠唤醒由 waitSlot 的墙钟分段兜住，不需要这里）。今天已有签到时点过去、
+	// 且仍有账号今天没签，就立刻补一次；已签的号跳过，签到禁用则整段不跑。
+	// 异步执行：不阻塞监听启动，耗时随账号数增长。
+	go sch.RunStartupCatchup()
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，

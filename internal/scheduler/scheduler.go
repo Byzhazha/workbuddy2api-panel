@@ -464,10 +464,85 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
-	expiringSoon := s.ExpiringSoonWindow()
+	// 全量语义（排程 / 面板「全部签到」）：已签到的号也照跑一遍——上游返回
+	// 「今天已签到」按幂等成功处理，随后的余额查询仍会刷新积分并解冻冷却号。
+	s.runCheckin(s.checkinTargets(false))
+	s.RunStreakBonusNow()
+}
+
+// RunStartupCatchup 启动即补跑签到：补「关机 / 重启 / 进程被杀期间错过的时点」。
+//
+// 为什么需要（排程不补历史）：nextFire 严格取 now 之后最近的整点，进程在 09:00
+// 不在跑，这个时点就永久错过——启动后主循环只从「现在」往后排，不会回头补当天。
+// 睡眠/休眠不需要它（waitSlot 按墙钟分段等待，唤醒瞬间即补跑）；**关机**才需要。
+//
+// 为什么不是「每次启动都全量打一轮」（三道门控，近乎零成本）：
+//   - schedule.checkin_enabled=false 时整段不跑（关签到就是关签到，补跑一并关）；
+//   - 今天还没有任何签到时点过去（如 08:00 启动）不跑，等 09:00 正常排程；
+//   - 逐号按 last_checkin_day 判重：今天已签的号跳过，只有真漏的号才发请求。
+//
+// 并发安全：签到幂等（IsAlreadyCheckin 算成功），最坏情况是与排程撞在同一时点，
+// 多出一行「今天已签到（幂等）」日志，不会重复加分。
+// 末尾连登管家一并补跑：它挂在签到闭环里（补签昨日 / 兑换档位 / 抽奖），漏签那天
+// 同样漏掉了它——只补签到不补管家，连登档位仍会错过当天。
+func (s *Scheduler) RunStartupCatchup() {
+	s.startupCatchupAt(time.Now())
+}
+
+// startupCatchupAt 是 RunStartupCatchup 的可注入时钟版本：测试用固定 now 判定
+// 「今天是否已有过点」，避免用例在整点/零点边界抖动。
+func (s *Scheduler) startupCatchupAt(now time.Time) {
+	s.schedMu.Lock()
+	hours, off := s.cfg.CheckinHours, s.cfg.CheckinDisabled
+	s.schedMu.Unlock()
+	if off {
+		return
+	}
+	slot := latestPassedSlotToday(now, hours)
+	if slot.IsZero() {
+		return // 今天第一个时点还没到：正常排程会跑，不必补
+	}
+	targets := s.checkinTargets(true) // skipCheckedIn=true：只补今天没签过的号
+	if len(targets) == 0 {
+		return
+	}
+	log.Printf("checkin 启动补跑：今天的 %s 时点已错过，%d 个账号待补签", slot.Format("15:04"), len(targets))
+	s.runCheckin(targets)
+	s.RunStreakBonusNow()
+}
+
+// latestPassedSlotToday 返回今天已经过去的最近一个整点时点；今天尚无可点时返回零值。
+// 与 nextFire 互补：nextFire 看未来，本函数看今天已过。
+func latestPassedSlotToday(now time.Time, hours []int) time.Time {
+	var latest time.Time
+	for _, h := range hours {
+		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+		if t.After(now) {
+			continue
+		}
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	return latest
+}
+
+// checkinTarget 单个待签到账号：pool 状态快照（UID / 昵称 / 禁用 / 今日已签）+ 凭证。
+type checkinTarget struct {
+	st pool.Status
+	a  *auth.Auth
+}
+
+// checkinTargets 按统一规则筛出本轮要签到的账号。
+// skipCheckedIn=true 时跳过 last_checkin_day 已是今天的号（启动补跑用）。
+func (s *Scheduler) checkinTargets(skipCheckedIn bool) []checkinTarget {
 	includeDisabled := s.includeDisabledInTasks()
+	var out []checkinTarget
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
+			continue
+		}
+		if skipCheckedIn && st.CheckinDone {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -480,6 +555,17 @@ func (s *Scheduler) RunCheckinNow() {
 		if a.IsGlobal() {
 			continue
 		}
+		out = append(out, checkinTarget{st: st, a: a})
+	}
+	return out
+}
+
+// runCheckin 对 targets 逐个签到 + 查余额解冻（冷却中的账号也参与：签到就是为了解冻它们）。
+// 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车；连登管家由调用方决定是否跟在后面。
+func (s *Scheduler) runCheckin(targets []checkinTarget) {
+	expiringSoon := s.ExpiringSoonWindow()
+	for _, t := range targets {
+		st, a := t.st, t.a
 		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
 		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
 		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
@@ -518,7 +604,6 @@ func (s *Scheduler) RunCheckinNow() {
 			ExpiryBuckets:     poolExpiryBuckets(buckets),
 		})
 	}
-	s.RunStreakBonusNow()
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
