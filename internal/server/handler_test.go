@@ -850,21 +850,23 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	}
 }
 
-func TestChatSessionDeadDisables(t *testing.T) {
+func TestChatSessionDeadRequiresThreeFailures(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 401, `{"code":12153,"msg":"Offline user session not found"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != 503 {
-		t.Errorf("code=%d", rec.Code)
-	}
-	st, _ := p.Status("u1")
-	if !st.Disabled {
-		t.Errorf("account should be disabled: %+v", st)
+	for attempt := 1; attempt <= 3; attempt++ {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 503 {
+			t.Errorf("attempt %d: code=%d", attempt, rec.Code)
+		}
+		st, _ := p.Status("u1")
+		if st.Disabled != (attempt == 3) {
+			t.Errorf("attempt %d: disabled=%v, want %v: %+v", attempt, st.Disabled, attempt == 3, st)
+		}
 	}
 }
 

@@ -128,3 +128,29 @@ func TestBareModelCrossDomainFallbackOnNoHealthyAccount(t *testing.T) {
 		t.Errorf("calls=%v want cn 0 次、global 1 次", calls)
 	}
 }
+
+// 跨域回退不能绕过另一域的 models.hidden 配置：否则模型列表虽隐藏，裸名请求仍会
+// 在 global 账号上执行。
+func TestBareModelCrossDomainFallbackRespectsOtherRealmHidden(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at-cn" {
+			return 400, `{"code":11102,"msg":"model [hidden-global-model] service info not found"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := newRealmPool(t)
+	p.SetCrossDomainFallback(true)
+	h := NewHandler(Config{Pool: p, Upstream: up, ModelsHidden: []string{"global:hidden-global-model"}})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"hidden-global-model","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
+		t.Fatalf("code=%d body=%s (want 400 model_unavailable)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-cn"] != 1 || calls["Bearer at-gl"] != 0 {
+		t.Errorf("calls=%v want cn 1 次、global 0 次（隐藏模型不得跨域回退）", calls)
+	}
+}

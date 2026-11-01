@@ -590,6 +590,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 在途占满，或该域账号对这个模型 11102 后进入模型级负缓存）时，改用另一域再选一次；
 	// 显式 cn:/global: 前缀保持原语义，永不回退。
 	crossRealm := !realmExplicit && h.cfg.Pool.CrossDomainFallback()
+	hiddenModels := h.loadLive().HiddenModels
+	if crossRealm {
+		// 裸模型名允许跨域选号，但另一域若已配置隐藏，不能绕过该业务开关。
+		otherRealm := "global"
+		if realm == "global" {
+			otherRealm = "cn"
+		}
+		if _, hidden := hiddenModels[otherRealm+":"+bareModel]; hidden {
+			crossRealm = false
+		}
+	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -603,7 +614,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
 	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
-	if _, hide := h.loadLive().HiddenModels[realm+":"+bareModel]; hide {
+	if _, hide := hiddenModels[realm+":"+bareModel]; hide {
 		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
 			"model is hidden by gateway configuration, try another model", "")
 		st.status = http.StatusBadRequest
@@ -876,7 +887,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+					h.cfg.Pool.NoteSessionDead(acct.UID)
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
@@ -886,6 +897,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
+			h.cfg.Pool.ClearSessionDead(acct.UID)
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
 				log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
@@ -1484,7 +1496,8 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		}
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		// 12153 可能由临时会话失效触发，沿用连续失败阈值，避免一次请求误停用账号。
+		h.cfg.Pool.NoteSessionDead(uid)
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
