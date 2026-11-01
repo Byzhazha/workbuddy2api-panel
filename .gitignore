@@ -46,3 +46,6 @@ docs/
 server.exe
 .DS_Store
 /wb2api.exe.old
+# 热替换暂存位：新版先编译到这里，重启时再换入正式名（运行中的 exe 在 Windows 上被独占
+# 锁定，服务不停机就无法直接覆盖）
+/wb2api.exe.new

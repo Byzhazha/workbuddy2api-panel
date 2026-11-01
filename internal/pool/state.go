@@ -445,6 +445,34 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	if p.inFlightFull(e) {
 		return nil
 	}
+	// 到期紧迫让位（粘性路径）：粘性直接按 uid 取号，**完全绕过**下面的加权抽签，
+	// 于是 prefer_expiring 对粘性会话一点作用都没有。实测（2026-11，4 号池）：
+	// 两个 2199 分的号当天各只接 2 个请求，而它们 11-30 各有 1699 分到期；
+	// 流量全压在那两个 6000+/7000+ 分的号上。
+	//
+	// 判据（用紧迫度比例，不用「有没有快过期批次」这种布尔门槛）：对端紧迫度
+	// ≥ 本号紧迫度 × urgencyYieldRatio，且越过 urgencyNoiseFloor，且该号本模型可服务、
+	// 未占满在途 → 返回 nil。handler 侧解绑后回落普通轮换（权重此刻正偏向紧迫度高的
+	// 号），成功请求会把会话 Bind 到新号（handler.go 的成功分支），绑定一次性搬完。
+	//
+	// 为什么是"比例"而不是"更早即让"：两边同样紧迫时搬来搬去只会抖动，用户要的是
+	// 「谁更该花就多给谁」，不是「谁早一天就独占」。见 hasExpiringPeerLocked。
+	//
+	// 不做的事：prefer_expiring=false、对端只是冷却/满载/该模型被限流、或紧迫度
+	// 差距不到 2 倍时，一律原样放行，不制造无意义的重绑抖动。
+	if p.hasExpiringPeerLocked(e, model, now) {
+		// 日志节流：这个分支在差距持续期间每个请求都会命中，运行日志环只有 500 行，
+		// 不节流会把它整个刷掉（任务/对话日志全丢）。5 分钟一个号一条足够定位。
+		if last, ok := p.expiringYieldLog[e.a.UID]; !ok || now.Sub(last) >= 5*time.Minute {
+			if p.expiringYieldLog == nil {
+				p.expiringYieldLog = make(map[string]time.Time, 8)
+			}
+			p.expiringYieldLog[e.a.UID] = now
+			log.Printf("[pool] prefer_expiring: sticky acct=%s model=%s 紧迫度 %.4f，让位给更紧迫的号（unbind）",
+				logfmt.Label(e.a.UID, e.a.Nickname), model, urgencyOf(e, now))
+		}
+		return nil
+	}
 	e.lastUsed = now
 	p.pickSeq++
 	e.usedSeq = p.pickSeq

@@ -214,14 +214,19 @@ type Config struct {
 		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
-		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
-		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
-		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
-		// 关闭后完全不使用到期信息选号。
+		// PreferExpiring 到期紧迫优先路由开关，默认 true。开启后按
+		// 「最早到期批次剩余占比 ÷ (距到期天数+1)」算出紧迫度，权重里加一项
+		// expiring_bonus × 该号紧迫度 / 候选集最大紧迫度（见 pool.urgencyOf）。
+		// 无天数阈值：越近、占比越大加分越高，远期自然趋零。
+		// 关闭后完全不使用到期信息选号（含粘性让位）。
 		PreferExpiring bool `json:"prefer_expiring"`
-		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
-		// 此窗口内的批次令账号命中上述 ×3 加权；窗口开大 → 命中账号变多、
-		// 偏好被稀释。空/0 = 禁用该加权门槛。
+		// ExpiringBonus 到期紧迫项的最大加分，默认 40（credits 项满分 10 的 4 倍）。
+		// 加项而非乘子 → 明显倾斜但不会让某个号独占全部流量；调大更激进、调小更温和。
+		// <=0/非法值回落默认（要关请用 prefer_expiring=false）。
+		ExpiringBonus float64 `json:"expiring_bonus"`
+		// ExpiringSoon 快过期提醒窗口（如 "168h"=7天）：仅用于面板「快到期」展示与
+		// 日志告警，**不再参与选号加权**（旧实现拿它当 ×3 门槛，已改为连续紧迫度）。
+		// 空/0 = 关闭该提醒分桶。
 		ExpiringSoon string `json:"expiring_soon"`
 		// CostExploreInterval costTier 条件探索窗口（issue #136 方案 a′）：tier 0
 		// 垄断层存在且 tier 1 有成员时，距上次探索 ≥ 窗口则本次 pick 生效层切
@@ -326,7 +331,8 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.PreferExpiring = true
-	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	c.Pool.ExpiringBonus = 40    // 到期紧迫项上限：明显倾斜但不独占（见 pool.urgencyOf）
+	c.Pool.ExpiringSoon = "168h" // 快过期提醒窗口默认 7 天（仅提醒，不参与选号）
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
 	c.SessionSticky.Enabled = true
@@ -488,6 +494,11 @@ func applyEnv(c *Config) {
 			c.Pool.PreferExpiring = b
 		}
 	}
+	if v := os.Getenv("WB2A_EXPIRING_BONUS"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Pool.ExpiringBonus = f
+		}
+	}
 	if v := os.Getenv("WB2A_DNS"); v != "" {
 		c.DNSServers = splitCSV(v)
 	}
@@ -555,6 +566,12 @@ func (c *Config) normalize() error {
 	if c.ExpiringSoonDur < 0 {
 		c.ExpiringSoonDur = 0
 		c.Pool.ExpiringSoon = "0"
+	}
+	// 到期紧迫项上限：<=0 / NaN 回落默认 40。0 会让这项特性静默失效、负值等于
+	// 惩罚余额快到期的号——两者都不是配置手滑该造成的结果（要关请 prefer_expiring=false），
+	// 故不报错、直接回落默认。
+	if !(c.Pool.ExpiringBonus > 0) {
+		c.Pool.ExpiringBonus = 40
 	}
 	// costTier 探索窗口（issue #136）：空值回落默认 30m（Default 已置；此兜底覆盖
 	// 显式 ""）；"0" 是合法值（关停，完全回到现状行为），不回落；负值钳 0 同关停

@@ -59,7 +59,16 @@ type Pool struct {
 	idleWeightMax     float64
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
+	// 粘性路径同样服从该开关（见 PickByUIDForModel 的让位判定）。
 	preferExpiring bool
+	// expiringBonus 到期紧迫项的最大加分（SetExpiringBonus 注入；默认 40）。
+	// 权重里与 credits 项（满分 10）、闲置项（≤5）并列相加，因此是"明显倾斜但不独占"。
+	expiringBonus float64
+	// expiringYieldLog 快到期让位日志的节流表（uid → 上次打印时刻，5 分钟一条）。
+	// 该分支在「粘性号不过期 + 池里确有快过期号」期间**每个请求**都会命中，而运行
+	// 日志环只有 500 行——不限流会把这 500 行整个刷掉，任务/对话日志全丢。
+	// 仅在持 p.mu 时读写，惰性初始化。
+	expiringYieldLog map[string]time.Time
 	// crossDomainFallback 裸模型名跨域回退开关（默认 false = 零回归，issue #135）。
 	// 仅由选号调用方（server handler）读取：开启后，未带 realm 前缀的请求在首选域
 	// 选不到可用号时改用另一域再选一次；显式 cn:/global: 前缀不受影响。
@@ -101,6 +110,7 @@ func New(stateFp string) *Pool {
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
 		preferExpiring:     true,
+		expiringBonus:      defaultExpiringBonus,
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,
@@ -199,6 +209,17 @@ func (p *Pool) SetPreferExpiring(enabled bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.preferExpiring = enabled
+}
+
+// SetExpiringBonus 注入到期紧迫项的最大加分（config pool.expiring_bonus，默认 40）。
+// 非正值/NaN 保留原值：0 会让该特性静默失效，负值会让"快过期"变成惩罚——都不该
+// 由一次手滑的配置达成，要关请用 prefer_expiring=false。
+func (p *Pool) SetExpiringBonus(v float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if v > 0 && v == v { // v==v 过滤 NaN
+		p.expiringBonus = v
+	}
 }
 
 // SetCrossDomainFallback 注入裸模型名跨域回退开关（issue #135；false = 零回归）。

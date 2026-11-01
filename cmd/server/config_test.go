@@ -859,3 +859,34 @@ func TestServerReadTimeout(t *testing.T) {
 		t.Error("unparsable read_timeout should fail fast")
 	}
 }
+
+// TestExpiringBonusDefaultAndClamp 到期紧迫项上限：默认 40；显式值生效；
+// <=0 / 非法值回落默认（0 会让特性静默失效、负值等于惩罚快到期号，都该被吞掉，
+// 要关请用 prefer_expiring=false）。
+func TestExpiringBonusDefaultAndClamp(t *testing.T) {
+	write := func(t *testing.T, body string) *Config {
+		t.Helper()
+		fp := filepath.Join(t.TempDir(), "c.json")
+		if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	if c := write(t, `{"pool":{"idle_weight_max":3}}`); c.Pool.ExpiringBonus != 40 {
+		t.Errorf("缺省 expiring_bonus=%v want 40", c.Pool.ExpiringBonus)
+	}
+	if c := write(t, `{"pool":{"expiring_bonus":12.5}}`); c.Pool.ExpiringBonus != 12.5 {
+		t.Errorf("显式 expiring_bonus=%v want 12.5", c.Pool.ExpiringBonus)
+	}
+	if c := write(t, `{"pool":{"expiring_bonus":0}}`); c.Pool.ExpiringBonus != 40 {
+		t.Errorf("0 应回落 40，got %v", c.Pool.ExpiringBonus)
+	}
+	if c := write(t, `{"pool":{"expiring_bonus":-5}}`); c.Pool.ExpiringBonus != 40 {
+		t.Errorf("负值应回落 40，got %v", c.Pool.ExpiringBonus)
+	}
+}

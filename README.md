@@ -422,8 +422,9 @@ curl -s http://localhost:7863/v1/search/messages \
 | `pool.strategy.domestic` | `weighted_random` | 国内版账号池调度：`weighted_random` / `round_robin` / `sequential_exhaust`，支持热更新 |
 | `pool.strategy.international` | `weighted_random` | 国际版账号池独立调度策略，同上；不改变既有地区路由 |
 | `pool.account_order.domestic` / `international` | `[]` | 对应地区的 UID 优先顺序；未列出账号按 UID 排序追加；只用于轮询和顺序耗尽 |
-| `pool.prefer_expiring` | `true` | 快过期积分加权：窗口内仍有有效快过期批次的账号，选号权重 ×3（虚拟实例）；不按到期时间排序、与批次金额无关；是软偏好，弱于会话粘性与模型成本分层（#101） |
-| `pool.expiring_soon` | `168h` | 快过期加权窗口：仅窗口内仍有有效批次的账号命中上述 ×3；窗口开大 → 命中账号变多、偏好被稀释；留空或 `0` 关闭 |
+| `pool.prefer_expiring` | `true` | 到期紧迫优先路由：每个账号按「最早到期批次剩余占比 ÷ (距到期天数+1)」算紧迫度，权重里加一项 `expiring_bonus × 该号紧迫度 / 候选集最大紧迫度`。**无天数阈值**——越近、占比越大加分越高，远期自然趋零；粘性会话在紧迫度差距 ≥2 倍时让位（`urgencyYieldRatio`） |
+| `pool.expiring_bonus` | `40` | 到期紧迫项的最大加分（credits 项满分 10 的 4 倍）。加项而非乘子 → 明显倾斜但不独占；调大更激进、调小更温和；`<=0`/非法值回落默认（要关用 `prefer_expiring=false`） |
+| `pool.expiring_soon` | `168h` | **仅**面板「快到期」展示与日志告警的窗口，不再参与选号加权（旧实现拿它当 ×3 门槛）；留空或 `0` 关闭该提醒分桶 |
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
@@ -528,17 +529,19 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 1. 过滤：禁用 / 冷却 / 熔断 / 在途占满账号不参与
 2. 按模型实测成本分层，只保留当前最优层
-3. 默认开启快过期积分加权（软偏好，不改排序）：
+3. 到期紧迫优先（软偏好，改权重不改排序；`prefer_expiring=false` 关闭）：
 
-   - 在模型成本最优层内，`expiring_soon` 窗口内仍有有效快过期批次的账号，选号权重 ×3（`expiringVirtualSlots` 虚拟实例展开，会话粘性路径同口径）。
-   - 不按到期时间排序、与批次金额无关：14 天后到期与 3 天后到期、1 分与几千分，只要在窗口内待遇相同。
-   - 该偏好弱于会话粘性（绑定号健康则直接使用）与模型成本分层（按实测成本硬过滤）；已过期、零余额、无有效到期时间的账号不进入加权集。
-4. 同一候选池内加权随机（快过期命中账号在上面的基础上 ×3）：
+   - 每个账号算紧迫度 **`(最早到期批次剩余 ÷ 该号总积分) ÷ (距到期天数 + 1)`**——既看「有多少分真在危险里」，也看「还剩几天」。**没有天数阈值**：远期批次被 `1/(天数+1)` 自然压到接近 0，也不需要为了「第 8 天算不算紧迫」拍一个魔数。
+   - 权重里加一项 `expiring_bonus × 该号紧迫度 ÷ 候选集最大紧迫度`（默认 `expiring_bonus=40`）。**加项而非乘子**：乘子会把积分基数大的号一起放大（主力号越滚越大），加项有固定上限，因此是「明显倾斜但不独占」。
+   - 会话粘性不再绕过它：命中粘性号但池内另有紧迫度 ≥2 倍（`urgencyYieldRatio`）且本模型可服务、未满载的号时解绑换号；差距不到 2 倍则原样放行（避免来回抖动）。日志按号 5 分钟节流。
+   - 该偏好弱于模型成本分层（按实测成本硬过滤）；已过期、零余额、无有效到期时间的账号紧迫度为 0。
+4. 同一候选池内加权随机：
 
-   `weight = credits 比例 ×10 + idleWeight`
+   `weight = 1 + credits 比例 ×10 + idleWeight + expiring_bonus × 紧迫度 ÷ 候选集最大紧迫度`
 
    - `credits 比例` = 该号积分 / 候选集最大积分
    - `idleWeight` = `min(闲置小时 × idle_weight_per_hour, idle_weight_max)`，从未使用给满分
+   - 紧迫项在 `prefer_expiring=false` 或候选集全员无到期压力时恒为 0（退化为旧权重）
 5. 防惊群：跳过 100ms 内刚被选中的账号；全冷却时从非禁用、非余额耗尽的软冷却 / 熔断账号中选最早到期者顶班
 
 ### 会话粘性

@@ -152,11 +152,14 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		tier   int
 		cost1k float64
 	}
+	// 到期紧迫项的归一化基准：与 maxCredits 同口径（tier 过滤前的全集候选），
+	// 保证截断排序与抽签权重用同一把尺。prefer_expiring=false → 0，整段跳过。
+	maxUrg := p.maxUrgency(cands, now)
 	ws := make([]weighted, 0, len(cands))
 	for _, e := range cands {
 		ti, ci := costTier(e)
 		if ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci})
+			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, maxUrg, now), tier: ti, cost1k: ci})
 		}
 	}
 	if strategy := p.strategyForRealmLocked(realm); strategy != WeightedRandom {
@@ -369,12 +372,31 @@ func (p *Pool) inFlightFull(e *entry) bool {
 // 生产默认 100ms；纯加权分布测试可临时置 0 关闭防撞号。
 var minPickGap = 100 * time.Millisecond
 
+// 到期紧迫度相关常量。
+const (
+	// defaultExpiringBonus 到期紧迫项的最大加分（权重里与 credits 项满分 10 同量级、
+	// 但可配置）。40 ≈ "紧迫度最高的号" 比同积分同闲置的号多出 40 分权重——
+	// 足以压过 credits 差异，又不至于让其余号完全没流量。
+	defaultExpiringBonus = 40
+
+	// urgencyYieldRatio 粘性让位门槛：对端紧迫度至少是粘性号的多少倍才值得搬一次
+	// 会话。2 = 明显更该花才让位；1 会让"两边一样紧迫"也来回搬（抖动），
+	// 留 1 则等于"谁更早搬给谁"，与"均衡"目标相悖。
+	urgencyYieldRatio = 2.0
+
+	// urgencyNoiseFloor 让位的最小紧迫度地板：账上只有一丁点远期积分（如 2027 年
+	// 才到期的 1 分）也算"有紧迫度"，但它不该推动任何路由决策。0.001 ≈ 3% 的积分
+	// 在 30 天内到期这一量级。
+	urgencyNoiseFloor = 0.001
+)
+
 // pickWeighted 加权随机（claude-api selectWeightedRandom 参考口径）：
 //
-//		weight = credits 比例 × 10 + idleWeight
+//		weight = 1 + credits 比例 × 10 + idleWeight（≤ idleWeightMax）+ 到期紧迫项
 //
 //	  - credits 比例 = 该号 credits / 候选集内最大 credits（避免量纲爆炸）
-//	  - idleWeight = min(距 lastUsed 小时数 × idleWeightPerHour, idleWeightMax)；从未使用给满分
+//	  - idleWeight = min(距 lastUsed 小时数 × idleWeightPerHour, idleWeightMax)
+//	  - 到期紧迫项 = expiringBonus × 该号紧迫度 / 候选集最大紧迫度（见 urgencyOf）
 //
 // credits 全 0 时仍按 idleWeight 加权（不退化均匀随机）。
 // 权重为浮点，用 int64 定点（×1e6）抽签可保持确定性随机源注入（randInt64N 语义不变）。
@@ -387,11 +409,12 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 			maxCredits = e.credits
 		}
 	}
+	maxUrg := p.maxUrgency(cands, now)
 	const scale = 1_000_000 // 定点放大：int64 累加权重大整数抽签
 	weights := make([]int64, len(cands))
 	var total int64
 	for i, e := range cands {
-		w := p.routingWeightOf(e, maxCredits, now)
+		w := p.routingWeightOf(e, maxCredits, maxUrg, now)
 		weights[i] = int64(w * scale)
 		total += weights[i]
 	}
@@ -440,7 +463,65 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	return w
 }
 
-// expiringNow 报告账号是否存在当前仍有效的快过期积分批次。
+// maxUrgency 候选集内的最大紧迫度（归一化基准）。prefer_expiring=false 时返回 0，
+// 调用方据此整段跳过（省掉每候选一次 urgencyOf）。
+func (p *Pool) maxUrgency(cands []*entry, now time.Time) float64 {
+	if !p.preferExpiring {
+		return 0
+	}
+	var m float64
+	for _, e := range cands {
+		if u := urgencyOf(e, now); u > m {
+			m = u
+		}
+	}
+	return m
+}
+
+// urgencyOf 到期紧迫度 = (最早到期批次的剩余 / 该号总积分) ÷ (距到期天数 + 1)。
+//
+// 为什么不用「N 天内到期」这种阈值：阈值是拍脑袋参数，而且是阶跃的——第 8 天不紧迫、
+// 第 7 天突然紧迫，账上 77% 要作废的号在门槛外就完全不算数（旧实现的实况）。
+// 真正决定「值不值得为它改路由」的是两件事的乘积：
+//   - 有多少积分真的在危险里（该批占比）；
+//   - 还剩多少时间（越近越紧迫）。
+//
+// 公式对两者都连续：远期批次被 1/(1+days) 自然压到接近 0，不需要窗口，也不会出现
+// 「1 分 3 天后到期」压过「2000 分 30 天后到期」的荒谬结果（前者 ≈0.00002/4，
+// 后者 ≈0.9/31）。已到期/正在过期（days<0）按最紧迫算（分母 1）。
+//
+// 取「最早到期的那一批」而非全部批次求和：一是与面板「最早到期」列同口径，二是
+// 求和会把「20 个小批次摊在整月」的号算得比「一大批 3 天后全作废」的号还紧迫。
+func urgencyOf(e *entry, now time.Time) float64 {
+	if e == nil || e.credits <= 0 {
+		return 0
+	}
+	amount, at := int64(0), time.Time{}
+	for _, b := range e.expiryBuckets {
+		if b.Remain <= 0 || b.ExpireAt.IsZero() {
+			continue
+		}
+		if at.IsZero() || b.ExpireAt.Before(at) {
+			amount, at = b.Remain, b.ExpireAt
+		}
+	}
+	// 无逐批明细（旧 state.json / 上游没给批次）时退回聚合的最早一批口径。
+	if at.IsZero() {
+		amount, at = e.creditsExpiring, e.creditsEarliestExpiry
+	}
+	if amount <= 0 || at.IsZero() {
+		return 0
+	}
+	days := at.Sub(now).Hours() / 24
+	if days < 0 {
+		days = 0
+	}
+	return (float64(amount) / float64(e.credits)) / (1 + days)
+}
+
+// expiringNow 报告账号是否存在当前仍有效的快过期批次（expiring_soon 窗口内）。
+// 注意：**选号路由已不再使用本判据**（见 urgencyOf），它仍用于面板展示与
+// WeightedAvailableUIDsForModelRealm 的旧入口语义。
 func expiringNow(e *entry, now time.Time) bool {
 	return e.creditsExpiring > 0 &&
 		e.creditsEarliestRemaining > 0 &&
@@ -448,12 +529,47 @@ func expiringNow(e *entry, now time.Time) bool {
 		e.creditsEarliestExpiry.After(now)
 }
 
-// routingWeightOf 在普通账号权重上叠加快过期虚拟实例数量。prefer_expiring=false
-// 或账号无有效快过期批次时，实例数恒为 1，结果与旧 weightOf 完全一致。
-func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
+// hasExpiringPeerLocked 报告除 self 之外是否还有「本模型此刻可服务 + 未占满在途 +
+// 到期紧迫度显著高于 self」的账号。调用方必须已持有 p.mu。
+//
+// 供粘性路径的让位判定（见 PickByUIDForModel）。判定用**比例**而非「有没有快过期
+// 批次」：紧迫度至少要达到 self 的 urgencyYieldRatio 倍（且越过噪声地板）才值得
+// 搬一次会话——否则「两边同样紧迫」时也搬，只会把流量来回倒腾（用户要的是均衡，
+// 不是抖动）。
+func (p *Pool) hasExpiringPeerLocked(self *entry, model string, now time.Time) bool {
+	if !p.preferExpiring {
+		return false
+	}
+	need := urgencyOf(self, now) * urgencyYieldRatio
+	if need < urgencyNoiseFloor {
+		need = urgencyNoiseFloor
+	}
+	for _, e := range p.byUID {
+		if e == self {
+			continue
+		}
+		if !e.healthyForModel(now, model) || p.inFlightFull(e) {
+			continue
+		}
+		if urgencyOf(e, now) >= need {
+			return true
+		}
+	}
+	return false
+}
+
+// routingWeightOf 在普通账号权重上叠加**到期紧迫项**。
+//
+// 紧迫项是「加项」而不是「乘子」：乘子会把整个权重按比例放大，积分基数大的号
+// 天然吃满（旧实现 ×3 的实况就是主力号越滚越大）；加项有固定上限（expiringBonus），
+// 只在一项里与 credits 项（满分 10）竞争，因此是"明显倾斜但不会独占"——正是
+// 「谁更该先花」想要的均衡语义。
+//
+// maxUrgency 为 0（prefer_expiring=false 或候选集全员无到期压力）时退化为旧权重。
+func (p *Pool) routingWeightOf(e *entry, maxCredits int64, maxUrgency float64, now time.Time) float64 {
 	w := p.weightOf(e, maxCredits, now)
-	if p.preferExpiring && expiringNow(e, now) {
-		return w * expiringVirtualSlots
+	if maxUrgency > 0 {
+		w += p.expiringBonus * urgencyOf(e, now) / maxUrgency
 	}
 	return w
 }

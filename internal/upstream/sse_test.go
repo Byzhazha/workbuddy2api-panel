@@ -934,13 +934,15 @@ func TestCreditPackagesExpiryTimestamp(t *testing.T) {
 	}
 }
 
-// TestUserResourceSnapshotDeductionEndTime 钉住快照与「检查」同口径：
-//  1. 体验版包必须用 DeductionEndTime（真失效时刻），不能把 CycleEndTime（周期
-//     重置日）当成到期日——线上表现就是 10-31 错报、实际 2035 年才失效；
-//  2. 同一天多个包要合并成一个自然日批次，earliestRemaining 是该日合计；
-//  3. CreditPackages（检查）与 UserResourceSnapshot（首页快照）对同一个包给出
-//     同一个失效时刻。
-func TestUserResourceSnapshotDeductionEndTime(t *testing.T) {
+// TestUserResourceSnapshotSpendByCycleBoundary 钉住「这批额度什么时候作废」
+// （packageSpendBy）的口径，这是 prefer_expiring / 到期提醒唯一的数据来源：
+//  1. 自然月重置的赠送包（CycleEndTime 在本月末、DeductionEndTime 在十年后）必须以
+//     CycleEndTime 作为到期日。旧口径用 DeductionEndTime，结果是这批额度永远落不进
+//     expiring_soon 窗口 —— 2026-11 实测「个人体验版」500 分/月因此每月白扔；
+//  2. 包寿命（DeductionEndTime）不能被丢掉，改由 CreditPackage.DeductionEndTime 透出；
+//  3. 同一天多个包合并成一个自然日批次，earliestRemaining 是该日合计；
+//  4. CreditPackages（检查）与 UserResourceSnapshot（首页快照）对同一个包给出同一时刻。
+func TestUserResourceSnapshotSpendByCycleBoundary(t *testing.T) {
 	now := time.Now().In(softRateResetLoc)
 	today := now
 	day2 := time.Date(today.Year(), today.Month(), today.Day()+2, 9, 0, 0, 0, softRateResetLoc)
@@ -969,7 +971,7 @@ func TestUserResourceSnapshotDeductionEndTime(t *testing.T) {
 	if remain != 638 || total != 650 {
 		t.Fatalf("remain/total=%d/%d want 638/650", remain, total)
 	}
-	// 体验版不在 72h 窗口内；只有 day2 的两个包计入。
+	// 体验版（cycleOnly，16 天后）不在 72h 窗口内；只有 day2 的两个包计入。
 	if expiring != 150 {
 		t.Fatalf("expiring=%d want 150", expiring)
 	}
@@ -983,17 +985,87 @@ func TestUserResourceSnapshotDeductionEndTime(t *testing.T) {
 	if buckets[0].Date != day || buckets[0].Remain != 150 || !buckets[0].ExpireAt.Equal(day2) {
 		t.Fatalf("bucket[0]=%+v want date=%s remain=150 expire=%v", buckets[0], day, day2)
 	}
-	if buckets[1].Remain != 488 || !buckets[1].ExpireAt.Equal(far) {
-		t.Fatalf("experience bucket=%+v want remain=488 expire=%v（不是 CycleEndTime %v）", buckets[1], far, cycleOnly)
+	// 关键断言：体验版批次落在周期边界（cycleOnly），不是包寿命 far。
+	if buckets[1].Remain != 488 || !buckets[1].ExpireAt.Equal(cycleOnly) {
+		t.Fatalf("experience bucket=%+v want remain=488 expire=%v（周期边界，不是包寿命 %v）",
+			buckets[1], cycleOnly, far)
+	}
+
+	// 窗口放大到 30 天：体验版的 488 分必须进 expiring——这正是旧口径下永远做不到的
+	// 那一步（额度到期了却从不被优先消耗）。
+	_, _, expiringWide, _, _, _, err := c.UserResourceSnapshot(
+		&auth.Auth{AccessToken: "at", UID: "u1"}, 30*24*time.Hour,
+	)
+	if err != nil {
+		t.Fatalf("snapshot(wide): %v", err)
+	}
+	if expiringWide != 638 {
+		t.Fatalf("expiring(30d)=%d want 638（150 + 体验版 488 必须计入）", expiringWide)
 	}
 
 	packs, _, _, err := c.CreditPackages(&auth.Auth{AccessToken: "at", UID: "u1"})
 	if err != nil {
 		t.Fatalf("packages: %v", err)
 	}
+	var okSpendBy, okLifetime bool
 	for _, p := range packs {
-		if p.Name == "experience" && p.ExpiresAt != far.UnixMilli() {
-			t.Fatalf("CreditPackages experience expires_at=%d want %d（两条路径必须同口径）", p.ExpiresAt, far.UnixMilli())
+		if p.Name != "experience" {
+			continue
+		}
+		okSpendBy = p.ExpiresAt == cycleOnly.UnixMilli()
+		okLifetime = p.DeductionEndTime == far.Format(time.RFC3339)
+	}
+	if !okSpendBy {
+		t.Fatalf("CreditPackages experience expires_at 必须是周期边界 %v（与快照同口径）", cycleOnly)
+	}
+	if !okLifetime {
+		t.Fatalf("CreditPackages 必须保住包寿命 deduction_end_time=%v", far)
+	}
+}
+
+// TestPackageSpendBy 覆盖 packageSpendBy 的保守回退：宁可少报一次到期，也不能让
+// 周期字段把真实余额从到期视图里藏掉。
+func TestPackageSpendBy(t *testing.T) {
+	now := time.Now().In(softRateResetLoc)
+	in10d := now.Add(10 * 24 * time.Hour).Format(packageEndLayout)
+	in30d := now.Add(30 * 24 * time.Hour).Format(packageEndLayout)
+	past := now.Add(-24 * time.Hour).Format(packageEndLayout)
+	// 秒截断：DeductionEndTime 走 UnixMilli（带亚秒），want 走墙钟字符串（秒精度），
+	// 不截断会差出纳秒级，与被测逻辑无关。
+	in5d := now.Add(5 * 24 * time.Hour).Truncate(time.Second)
+	lifetime := now.AddDate(9, 0, 0).UnixMilli()
+
+	cases := []struct {
+		name       string
+		deductMS   int64
+		cycleEnd   string
+		wantToPast bool // true = 结果必须是过去（用于断言"不该被采用"的逻辑反向）
+		wantStr    string
+	}{
+		// 自然月重置：周期边界更早且在未来 → 采用周期边界。
+		{name: "周期边界更早", deductMS: lifetime, cycleEnd: in10d, wantStr: in10d},
+		// 包寿命更早 → 保持包寿命（周期边界在它之后，没有额外信息）。
+		{name: "包寿命更早", deductMS: in5d.UnixMilli(), cycleEnd: in30d,
+			wantStr: in5d.Format(packageEndLayout)},
+		// 周期边界已在过去（跨月瞬间上游还没换新周期）→ 回退包寿命，不能返回过去的时刻。
+		{name: "周期边界已过期", deductMS: lifetime, cycleEnd: past, wantStr: ""},
+		// 没有 DeductionEndTime → 回落到周期边界。
+		{name: "仅周期边界", deductMS: 0, cycleEnd: in10d, wantStr: in10d},
+	}
+	for _, tc := range cases {
+		got, ok := packageSpendBy(tc.deductMS, "", "", tc.cycleEnd, now)
+		if !ok {
+			t.Fatalf("%s: 应返回有效时刻", tc.name)
+		}
+		if tc.wantStr == "" {
+			if !got.After(now) {
+				t.Fatalf("%s: 得到过去时刻 %v（周期字段不得把余额藏掉）", tc.name, got)
+			}
+			continue
+		}
+		want, _ := parsePackageEndTime(tc.wantStr)
+		if !got.Equal(want) {
+			t.Fatalf("%s: got=%v want=%v", tc.name, got, want)
 		}
 	}
 }

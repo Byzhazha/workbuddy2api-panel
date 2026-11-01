@@ -1809,30 +1809,91 @@ func TestPickExpiringTieUsesExistingWeight(t *testing.T) {
 	}
 }
 
+// TestPreferExpiringDisabledRestoresWeight 钉住到期紧迫项的「加项」语义：
+// 开启时紧迫度高的号权重更高（上限 expiringBonus），关闭时两者完全相等。
+//
+// 旧实现是 ×expiringVirtualSlots 的乘子；乘子会把积分基数大的号一起放大（主力号
+// 越滚越大），加项才有"明显倾斜但不独占"的均衡语义——见 routingWeightOf 注释。
 func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "a"})
 	p.Add(&auth.Auth{UID: "b"})
 	now := time.Now()
-	p.SetCreditsDetailed("a", 100, 100, 50, now.Add(time.Hour), 50)
+	// a：全部收紧在 1 小时后到期 → 紧迫度 = 1.0/1 = 1.0（最大）；
+	// b：无到期压力 → 0。
+	p.SetCreditsDetailed("a", 100, 100, 100, now.Add(time.Hour), 100)
 	p.SetCreditsDetailed("b", 100, 100, 0, time.Time{}, 0)
 
 	p.mu.Lock()
-	we := p.routingWeightOf(p.byUID["a"], 100, now)
-	wn := p.routingWeightOf(p.byUID["b"], 100, now)
+	ua := urgencyOf(p.byUID["a"], now)
+	a := p.routingWeightOf(p.byUID["a"], 100, ua, now)
+	b := p.routingWeightOf(p.byUID["b"], 100, ua, now) // 同一归一化基准
 	p.mu.Unlock()
-	if we != wn*expiringVirtualSlots {
-		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
+	if ua <= 0 {
+		t.Fatalf("a 的紧迫度应为正，got %v", ua)
+	}
+	if got := a - b; got <= 0 || got > defaultExpiringBonus+1e-9 {
+		t.Fatalf("紧迫项应落在 (0, %v]，got 差值 %v", defaultExpiringBonus, got)
 	}
 
 	p.SetPreferExpiring(false)
 
 	p.mu.Lock()
-	wa := p.routingWeightOf(p.byUID["a"], 100, now)
-	wb := p.routingWeightOf(p.byUID["b"], 100, now)
+	// 关闭后 maxUrgency 由 maxUrgency() 返回 0（这里直接传 0 模拟调用点行为）。
+	wa := p.routingWeightOf(p.byUID["a"], 100, 0, now)
+	wb := p.routingWeightOf(p.byUID["b"], 100, 0, now)
 	p.mu.Unlock()
 	if wa != wb {
 		t.Fatalf("disabled expiring weights differ: %v/%v", wa, wb)
+	}
+	if p.maxUrgency([]*entry{p.byUID["a"]}, now) != 0 {
+		t.Fatal("prefer_expiring=false 时 maxUrgency 必须为 0（整段跳过）")
+	}
+}
+
+// TestUrgencyOf 紧迫度公式：占比 ÷ (天数+1)，无天数阈值、远期自然趋零。
+func TestUrgencyOf(t *testing.T) {
+	now := time.Now()
+	mk := func(credits, amount int64, after time.Duration) *entry {
+		e := &entry{credits: credits}
+		if amount > 0 {
+			e.expiryBuckets = []ExpiryBucket{{
+				Date:     now.Add(after).Format("2006-01-02"),
+				ExpireAt: now.Add(after),
+				Remain:   amount,
+			}}
+		}
+		return e
+	}
+	cases := []struct {
+		name string
+		e    *entry
+		want float64
+	}{
+		// 一半积分 1 天后到期：0.5/2 = 0.25
+		{"一半_1天", mk(100, 50, 24*time.Hour), 0.25},
+		// 全部 30 天后到期：1/31
+		{"全部_30天", mk(100, 100, 30*24*time.Hour), 1.0 / 31},
+		// 1 分 3 天后到期（100 万积分账户）→ 远小于后者，不会被"更早"骗走流量
+		{"一分_3天", mk(1_000_000, 1, 3*24*time.Hour), (1.0 / 1_000_000) / 4},
+		// 已过期（days<0）按最紧迫算：分母 1
+		{"已过期", mk(100, 40, -48*time.Hour), 0.4},
+		// 无到期批次
+		{"无批次", mk(100, 0, 0), 0},
+		// credits 归零：无从计算占比
+		{"零余额", mk(0, 0, 0), 0},
+	}
+	for _, tc := range cases {
+		got := urgencyOf(tc.e, now)
+		if diff := got - tc.want; diff > 1e-9 || diff < -1e-9 {
+			t.Errorf("%s: got=%v want=%v", tc.name, got, tc.want)
+		}
+	}
+	// 关键比较：2000 分 30 天后到期 必须比 1 分 3 天后到期 更紧迫（金额主导）。
+	big := urgencyOf(mk(2200, 2000, 30*24*time.Hour), now)
+	tiny := urgencyOf(mk(1_000_000, 1, 3*24*time.Hour), now)
+	if big <= tiny*10 {
+		t.Fatalf("金额大的批次应显著更紧迫：big=%v tiny=%v", big, tiny)
 	}
 }
 

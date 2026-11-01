@@ -1970,9 +1970,10 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的失效时刻：优先 DeductionEndTime（可抵扣窗口结束，真「用不完
-	// 就没了」），缺失依次回落 ExpiredTime / PackageEndTime / CycleEndTime（周期
-	// 边界，仅兜底）。RFC3339 或上游墙钟字符串，前端取日期部分展示。
+	// EndTime 该包「这批额度用不完就没了」的时刻 = packageSpendBy 的结果：
+	// min(可抵扣窗口终点 DeductionEndTime, 仍在未来的周期边界 CycleEndTime)。
+	// 自然月重置的赠送包报的是本月重置点（如 2026-11-30），包本身真正失效的
+	// 年份另见 DeductionEndTime 字段。前端取日期部分展示。
 	EndTime string `json:"end_time,omitempty"`
 	// ExpiresAt 与 EndTime 同源的 Unix 毫秒时间戳，供面板按精确剩余天数聚合。
 	ExpiresAt int64 `json:"expires_at,omitempty"`
@@ -1987,9 +1988,16 @@ type CreditPackage struct {
 	SubProductName string `json:"sub_product_name,omitempty"`
 	// Cycle 为 true 表示按周期发放的包（读 Cycle* 字段），否则读 Capacity*。
 	Cycle bool `json:"cycle,omitempty"`
+	// DeductionEndTime 包本身可抵扣窗口的终点（RFC3339），即「这个包还能用到哪一年」。
+	// 与 EndTime 的区别见 packageSpendBy：自然月重置的赠送包两者相差十年——
+	// EndTime 报的是本月额度重置点（如 2026-11-30），本字段报包真正失效的年份
+	// （如 2035-01-30）。两个都透出，读的人才能分清「本月额度」与「包的寿命」。
+	DeductionEndTime string `json:"deduction_end_time,omitempty"`
+	// CycleEndTime 上游原始周期边界（额度重置点）字符串，供对账。
+	CycleEndTime string `json:"cycle_end_time,omitempty"`
 }
 
-// ExpiryBucket 单个自然日到期的积分合计（按真实失效时刻 DeductionEndTime 聚合）。
+// ExpiryBucket 单个自然日到期的积分合计（按 packageSpendBy 的额度作废边界聚合）。
 // 面板首页「积分到期提醒」快照与「检查」（逐包明细）共用同一口径：
 //   - Date 为该日（UTC+8，YYYY-MM-DD），前端按这个日期分组展示；
 //   - ExpireAt 是该日最早一批的精确时刻，供「最早到期优先」选号路由使用；
@@ -2000,10 +2008,15 @@ type ExpiryBucket struct {
 	Remain   int64     `json:"remain"`
 }
 
-// packageEffectiveEnd 返回套餐的真实失效时刻：DeductionEndTime（可抵扣窗口结束，
-// epoch 毫秒）优先，缺失依次回落 ExpiredTime / PackageEndTime / CycleEndTime。
-// 与 CreditPackages 的字段优先级必须一致——快照与逐包明细两条路径口径分叉过一次
-// （快照把体验版的周期重置日 10-31 当成到期日，实际 DeductionEndTime 在 2035 年）。
+// packageEffectiveEnd 返回套餐**可抵扣窗口**的终点：DeductionEndTime（epoch 毫秒）
+// 优先，缺失依次回落 ExpiredTime / PackageEndTime / CycleEndTime。
+//
+// 这是「这个包还能用到什么时候」（包寿命）的口径，不是「这批额度什么时候作废」——
+// 后者见 packageSpendBy。两者对自然月重置的赠送包相差十年，搞混的代价是把每月
+// 500 分永久排出「快过期」视野（见 packageSpendBy 注释）。
+// 到期分桶 / 提醒 / 「最早到期优先」选号一律走 packageSpendBy；本函数只作为它的
+// 兜底与「包寿命」信息使用——快照与逐包明细两条路径必须同口径，否则会出现
+// 「首页说 11-30 到期、检查页说 2035 到期」的旧分叉。
 func packageEffectiveEnd(deductionEndMS int64, expired, packageEnd, cycleEnd string) (time.Time, bool) {
 	if deductionEndMS > 0 {
 		return time.UnixMilli(deductionEndMS).In(softRateResetLoc), true
@@ -2014,6 +2027,35 @@ func packageEffectiveEnd(deductionEndMS int64, expired, packageEnd, cycleEnd str
 		}
 	}
 	return time.Time{}, false
+}
+
+// packageSpendBy 返回「这一批额度用不完就没了」的最近边界，供到期提醒、快过期分桶
+// 与「最早到期优先」选号使用（口径 = min(可抵扣窗口终点, 仍在未来的周期边界)）。
+//
+// 为什么不能直接用 packageEffectiveEnd：自然月重置的赠送包会同时下发两个时间。实测
+// 2026-11 的「CodeBuddy个人体验版」（500 分/月）：
+//
+//	DeductionEndTime = 2035-01-30  （包本身还能用十年）
+//	CycleEndTime     = 2026-11-30  （本月这 500 分到点重置、用不完作废）
+//
+// 只看 DeductionEndTime 的后果不是"显示不好看"：这 500 分会永远落不进
+// expiring_soon 窗口 → prefer_expiring 永不生效、到期提醒永不提示、面板把它排成
+// "最晚到期"的那一桶 → **每个月白扔一次**。故取两者中更早的那个。
+//
+// 保守约束：周期边界只在**仍在未来**时才采用。跨月那一刻上游可能还没换出新周期
+// （CycleEndTime 还停在上个月的月末），此时回退到 packageEffectiveEnd——宁可少报
+// 一次到期，也不能让周期字段把真实存在的余额从到期视图里"藏"掉（那会让选号与
+// 提醒都看不见这笔钱）。
+func packageSpendBy(deductionEndMS int64, expired, packageEnd, cycleEnd string, now time.Time) (time.Time, bool) {
+	base, ok := packageEffectiveEnd(deductionEndMS, expired, packageEnd, cycleEnd)
+	ce, okCe := parsePackageEndTime(cycleEnd)
+	if !okCe || !ce.After(now) {
+		return base, ok
+	}
+	if ok && !ce.Before(base) {
+		return base, ok
+	}
+	return ce, true
 }
 
 // CreditPackages 返回账号当前的逐包构成。remain/size 为各包求和。
@@ -2092,10 +2134,16 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 		case p.CycleEndTime != "":
 			cp.EndTime = p.CycleEndTime
 		}
-		if end, ok := packageEffectiveEnd(p.DeductionEndTime, p.ExpiredTime, p.PackageEndTime, p.CycleEndTime); ok {
+		if end, ok := packageSpendBy(p.DeductionEndTime, p.ExpiredTime, p.PackageEndTime, p.CycleEndTime, now); ok {
 			cp.EndTime = end.Format(time.RFC3339)
 			cp.ExpiresAt = end.UnixMilli()
 		}
+		// 包寿命（可抵扣窗口终点）与原始周期边界单独透出，别让「本月额度」覆盖掉
+		// 「包的寿命」这条信息（自然月重置包两者差十年）。
+		if p.DeductionEndTime > 0 {
+			cp.DeductionEndTime = time.UnixMilli(p.DeductionEndTime).In(softRateResetLoc).Format(time.RFC3339)
+		}
+		cp.CycleEndTime = p.CycleEndTime
 		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
 		if p.CreateTime > 0 {
 			cp.CreatedAt = time.UnixMilli(p.CreateTime).Format(time.RFC3339)
@@ -2353,7 +2401,10 @@ func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain,
 		if r <= 0 {
 			continue
 		}
-		end, ok := packageEffectiveEnd(acct.DeductionEndTime, acct.ExpiredTime, acct.PackageEndTime, acct.CycleEndTime)
+		// 到期口径统一走 packageSpendBy（额度作废边界），不是 packageEffectiveEnd
+		// （包寿命）——自然月重置的 500 分/月体验额度必须落在本月重置日才知道要
+		// 优先花掉；用包寿命会把它们排到 2035 年，等于永不提醒。
+		end, ok := packageSpendBy(acct.DeductionEndTime, acct.ExpiredTime, acct.PackageEndTime, acct.CycleEndTime, now)
 		if !ok || !end.After(now) {
 			continue
 		}
