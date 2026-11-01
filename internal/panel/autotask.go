@@ -676,6 +676,25 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipped": true, "message": "该任务已领取过奖励"})
 		return
 	}
+	if before.Claimable {
+		credit, energy, err := claimTaskReward(p, a, act.TaskCode)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "领奖失败: "+err.Error())
+			return
+		}
+		message := "该任务已完成（进度 " + taskProgressText(before) + "）"
+		if credit > 0 || energy > 0 {
+			message += fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
+		} else {
+			message += "；奖励此前已领取"
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "skipped": true, "claimed": true,
+			"progress_before": taskProgressText(before), "progress_after": taskProgressText(before),
+			"message": message,
+		})
+		return
+	}
 	msg, err := act.run(p, a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "执行失败: "+err.Error())

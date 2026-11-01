@@ -35,6 +35,7 @@ type sweepBackend struct {
 	reqs    atomic.Int32
 	accepts atomic.Int32
 	claims  atomic.Int32
+	other   atomic.Int32
 }
 
 func sweepTasksBody(tasks []map[string]any) string {
@@ -91,8 +92,49 @@ func (b *sweepBackend) handler() http.HandlerFunc {
 			out, _ := json.Marshal(map[string]any{"code": 0, "msg": "OK", "data": data})
 			w.Write(out)
 		default:
+			b.other.Add(1)
 			w.Write([]byte(`{"code":0,"msg":"OK","data":{}}`))
 		}
+	}
+}
+
+// TestCompletedTaskClaimsWithoutAction 已达标但未领奖的任务直接领奖，不再重复执行
+// 可能消耗上游配额的动作；队列和单任务入口都保持同一口径。
+func TestCompletedTaskClaimsWithoutAction(t *testing.T) {
+	b := &sweepBackend{
+		listFn: func(isMP bool) []map[string]any {
+			if isMP {
+				return nil
+			}
+			return []map[string]any{sweepTask("chat_5", 5, 5, "accepted", nil)}
+		},
+		claimFn: func(code string) (int, map[string]any) {
+			return claimOK(map[string]any{"already_claimed": false, "credit": 100, "energy": 5})
+		},
+	}
+	p := newSweepPanel(t, b, &auth.Auth{UID: "u1", AccessToken: "at"})
+	a := p.cfg.Pool.AuthByUID("u1")
+	msg, err := p.runGrowthQueued(a, "chat_5")
+	if err != nil {
+		t.Fatalf("队列已完成任务处理失败: %v", err)
+	}
+	if !strings.Contains(msg, "自动领奖") || b.claims.Load() != 1 {
+		t.Fatalf("队列结果=%q 领奖次数=%d，want 自动领奖/1", msg, b.claims.Load())
+	}
+	if b.other.Load() != 0 {
+		t.Fatalf("队列不应执行付费动作，额外请求=%d", b.other.Load())
+	}
+
+	req := httptest.NewRequest("POST", "/panel/api/accounts/u1/tasks/auto",
+		strings.NewReader(`{"task_code":"chat_5"}`))
+	req.SetPathValue("uid", "u1")
+	rec := httptest.NewRecorder()
+	p.accountTaskAuto(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"skipped":true`) {
+		t.Fatalf("单任务结果 code=%d body=%s", rec.Code, rec.Body)
+	}
+	if b.claims.Load() != 2 || b.other.Load() != 0 {
+		t.Fatalf("单任务领奖次数=%d 额外请求=%d，want 2/0", b.claims.Load(), b.other.Load())
 	}
 }
 

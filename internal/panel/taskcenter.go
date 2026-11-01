@@ -439,6 +439,16 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 	if before.Claimed {
 		return "已完成（已领取）", nil
 	}
+	if before.Claimable {
+		credit, energy, err := claimTaskReward(p, a, code)
+		if err != nil {
+			return "", fmt.Errorf("领奖失败: %w", err)
+		}
+		if credit > 0 || energy > 0 {
+			return fmt.Sprintf("已完成（进度 %s）；自动领奖 +%d 分 +%d 能", taskProgressText(before), credit, energy), nil
+		}
+		return "已完成（进度 " + taskProgressText(before) + "）；奖励此前已领取", nil
+	}
 	msg, err := act.run(p, a)
 	if err != nil {
 		return "", err
