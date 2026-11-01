@@ -96,7 +96,7 @@ func (p *Pool) startFlusher() {
 			select {
 			case <-t.C:
 				p.mu.Lock()
-				if p.dirty.Swap(false) {
+				if p.dirty.Load() {
 					p.saveLocked()
 				}
 				p.mu.Unlock()
@@ -110,7 +110,7 @@ func (p *Pool) startFlusher() {
 // Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
 func (p *Pool) Flush() {
 	p.mu.Lock()
-	if p.dirty.Swap(false) {
+	if p.dirty.Load() {
 		p.saveLocked()
 	}
 	p.mu.Unlock()
@@ -259,6 +259,8 @@ func (p *Pool) saveLocked() {
 		p.notePersistFail(err)
 		return
 	}
+	// 持锁期间成功替换文件后才确认已保存，临时写入失败留待下一轮重试。
+	p.dirty.Store(false)
 	if p.persistFails > 0 {
 		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
 		log.Printf("pool: state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
