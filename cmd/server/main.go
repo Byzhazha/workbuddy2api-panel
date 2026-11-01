@@ -58,15 +58,13 @@ func main() {
 		if errors.Is(err, fs.ErrNotExist) {
 			// 首次运行：目录下没有配置 → 自动落一份推荐配置（含随机 api_key）再加载。
 			// 双击 exe / 裸跑 docker 即开，无需先手工复制样例。
-			if key, werr := WriteDefault(*cfgPath); werr == nil {
-				log.Printf("config %s 不存在，已生成推荐配置（api_key=%s，记录在该文件里，可自行修改）", *cfgPath, key)
-				cfg, err = Load(*cfgPath)
+			key, werr := WriteDefault(*cfgPath)
+			if werr != nil {
+				// 配置写入成功后才启动，保留实际写入错误供修正目录或文件权限。
+				log.Fatalf("生成配置 %s 失败: %v", *cfgPath, werr)
 			}
-			if err != nil {
-				// 生成失败（目录只读等）：退回纯默认 + env（旧行为兜底），不阻塞启动。
-				log.Printf("config %s not found (auto-generate failed), using defaults+env: %v", *cfgPath, err)
-				cfg, err = Load("")
-			}
+			log.Printf("config %s 不存在，已生成推荐配置（api_key=%s，记录在该文件里，可自行修改）", *cfgPath, key)
+			cfg, err = Load(*cfgPath)
 		}
 		if err != nil {
 			log.Fatalf("load config: %v", err)
@@ -385,7 +383,9 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -397,6 +397,8 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
+	// 监听关闭会先于在途请求完成；等待停机结束后再由 defer 保存用量和池状态。
+	<-shutdownDone
 	log.Printf("bye")
 }
 
