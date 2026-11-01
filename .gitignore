@@ -49,3 +49,11 @@ server.exe
 # 热替换暂存位：新版先编译到这里，重启时再换入正式名（运行中的 exe 在 Windows 上被独占
 # 锁定，服务不停机就无法直接覆盖）
 /wb2api.exe.new
+/wb2api.exe.staged
+# 每次 deploy 的旧版备份与回滚留证（文件名唯一、含时间戳）
+/wb2api.exe.old*
+/wb2api.exe.bad-*
+
+# 版本化构建产物与部署日志（scripts/win/*.ps1 的产出）
+/bin/
+/logs/
