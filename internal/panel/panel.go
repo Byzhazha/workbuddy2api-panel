@@ -129,6 +129,7 @@ const loginTTL = 15 * time.Minute
 type loginSession struct {
 	created time.Time
 	realm   string // "cn" / "global"，缺省 cn
+	polling bool   // 同一授权状态仅由一个轮询执行凭证保存与登录后处理。
 }
 
 // New 构建面板。

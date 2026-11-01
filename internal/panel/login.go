@@ -163,11 +163,29 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	p.loginMu.Lock()
 	sess, known := p.logins[state]
+	if known && !sess.polling {
+		active := sess
+		active.polling = true
+		p.logins[state] = active
+	}
 	p.loginMu.Unlock()
 	if !known {
 		writeErr(w, http.StatusNotFound, "unknown or expired state（请重新发起添加账号）")
 		return
 	}
+	if sess.polling {
+		writeJSON(w, http.StatusOK, map[string]any{"done": false})
+		return
+	}
+	// 未完成或失败时允许后续轮询重试，成功删除的会话保持已消费状态。
+	defer func() {
+		p.loginMu.Lock()
+		if current, exists := p.logins[state]; exists {
+			current.polling = false
+			p.logins[state] = current
+		}
+		p.loginMu.Unlock()
+	}()
 	_, epToken, epAcct, origin := loginEndpoints(sess.realm)
 
 	// auth/token 是权威登录状态端点：pending 时业务 code 非 0（"login ing"）。
