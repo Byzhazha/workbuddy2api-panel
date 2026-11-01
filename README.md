@@ -303,6 +303,32 @@ go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
 
 exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
 
+#### 改完代码怎么上线：一条命令（Windows）
+
+```powershell
+pwsh -File scripts\win\ship.ps1 -Commit "fix(pool): 改了啥"
+```
+
+它按顺序做完整条链路，任何一步失败都停下且线上保持不变：
+
+| 步骤 | 脚本 | 失败语义 |
+|---|---|---|
+| 提交 | `git add -A && git commit` | 有改动却没给 `-Commit` → 中止（先提交再编译，二进制文件名的 `<git sha>` 才能对应到提交） |
+| 测试 | `go vet ./...` + `go test ./...` | 不过 → 中止，线上文件与进程都不动 |
+| 编译 | `build.ps1` | 产物落 `bin\wb2api-<时间戳>-<sha>.exe`，备份留存可回滚 |
+| canary | `smoke.ps1` | 用隔离配置（备用端口 / 临时状态目录 / `schedule.*` 全关）把新二进制**真启动一次**，`/status` 200 才算过；失败 → 中止，不碰线上 |
+| 替换 | `deploy.ps1` | 两次 rename 完成（Windows 允许 rename 运行中的镜像），**不停服务** |
+| 重启 | `deploy.ps1` | 先等 `/status` 的 `in_flight` 连续 3s 为 0 再动手；超时则只换文件不重启（退出码 2）；起不来 → 自动用备份回滚 |
+| 自检 | `verify.ps1` | 校验「开机自启 → 磁盘文件 → 运行进程」三者一致，并识别「磁盘已是新版、进程仍是旧镜像」 |
+
+实测（Win11 + Go 1.25，2026-11-01）：替换文件零中断；重启的不可用窗口 **0.3~0.5s**（150ms 粒度探针零失败）。Go 在 Windows 上给监听器设 `SO_EXCLUSIVEADDRUSE`、端口不能双绑，所以"重启必然有一个亚秒级拒绝窗口"——要连这个也消掉，得在前面挂一层本机 TCP 转发。
+
+只想编译不部署：`build.ps1`；只想换文件不重启：`deploy.ps1 -NoRestart`；只跑测试：`ship.ps1 -NoDeploy`。
+
+#### 开机自启
+
+自启指向的是**固定文件名** `wb2api.exe`，而 `deploy.ps1` 就是把新版本落到这个名字上，所以自启永远拉起最新版，无需改自启项。`verify.ps1` 会打印当前自启方式（启动文件夹 VBS / 计划任务 / 注册表 Run）并核对哈希。
+
 ### 方式三：源码运行（开发调试）
 
 ```bash
