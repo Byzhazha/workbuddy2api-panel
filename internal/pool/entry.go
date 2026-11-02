@@ -450,18 +450,28 @@ func (e *entry) pruneExpiredModelCosts(now time.Time) {
 	}
 }
 
-// pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
-// pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项，
-// 无需清理。调用方必须已持有 p.mu 写锁。
+// pruneExpiredModelCooldownsLocked 惰性维护 modelCooldowns：先把旧口径遗留条目
+// 对齐到新口径，再删除真正过期的条目。pick 写锁路径调用，防止 map 无限膨胀；
+// status 只读遍历天然跳过过期项，无需清理。调用方必须已持有 p.mu 写锁。
 //
 // 过期判据取 displayUntil（max(Until, ResetAt)）而非 Until：网关提前放行后、
 // 上游重置墙钟未到之前，条目仍要留给台账/锁池展示（面板要显示「这个模型还在
 // 上游限流、几点恢复」），此时 route 侧已由 Until 自然放行，留着不改变选号行为。
-func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
+//
+// 对齐（自愈）：Until < ResetAt 只可能是旧口径（按 soft_rate_max 截断）写下的条目。
+// 新口径是「锁到上游恢复时刻」，所以就地重新对齐（只延长不缩短；ResetAt 已过期的
+// 交给下面的删除逻辑）。不这样做，那批老条目仍会在网关提前放行时白撞一次 429，
+// 面板也会继续显示「网关 17:37 起重试 · 上游称 19:26 恢复」这种自相矛盾的两行。
+func (p *Pool) pruneExpiredModelCooldownsLocked(e *entry, now time.Time) {
 	if len(e.modelCooldowns) == 0 {
 		return
 	}
 	for m, mc := range e.modelCooldowns {
+		if !mc.AuditOnly && !mc.ResetAt.IsZero() && now.Before(mc.ResetAt) && mc.Until.Before(mc.ResetAt) {
+			mc.Until = p.resetHonorUntilLocked(now, mc.ResetAt)
+			e.modelCooldowns[m] = mc
+			p.dirty.Store(true)
+		}
 		if mc.Until.IsZero() || !now.Before(mc.displayUntil()) {
 			delete(e.modelCooldowns, m)
 		}

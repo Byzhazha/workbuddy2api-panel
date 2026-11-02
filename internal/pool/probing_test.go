@@ -1,6 +1,8 @@
 package pool
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -58,6 +60,64 @@ func TestModelCooledNotCalledByFallback(t *testing.T) {
 	}
 }
 
+// TestLegacyCappedModelLockRealigned 旧口径（按 soft_rate_max 截断）遗留的锁：
+// 一旦出现 Until < ResetAt，选号路径的惰性维护必须把它重新对齐到上游恢复时刻，
+// 否则网关会在 17:37 提前放行、白撞一次 429（面板也会同时显示两个矛盾时刻）。
+func TestLegacyCappedModelLockRealigned(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(3 * time.Hour)
+	p.mu.Lock()
+	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+		// 复刻线上现状：Until 是旧 soft_rate_max=2h 截断写下的，ResetAt 才是上游口径。
+		"deepseek-v4.1-flash": {Until: time.Now().Add(105 * time.Minute), ResetAt: reset, Reason: "6004 model rate limit"},
+	}
+	p.mu.Unlock()
+
+	// 任意一次选号（写锁路径）触发惰性维护。
+	p.PickExcludingForModel(nil, "hy3-x")
+
+	p.mu.RLock()
+	mc := p.byUID["u1"].modelCooldowns["deepseek-v4.1-flash"]
+	p.mu.RUnlock()
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Fatalf("旧口径的 Until 应对齐到上游墙钟 %v，得到 %v", reset, mc.Until)
+	}
+	// 对齐后该模型整个恢复窗口内都不可选（不会再提前撞 429）。
+	if p.PickExcludingForModel(nil, "deepseek-v4.1-flash") != nil {
+		t.Error("对齐后恢复时刻前不得再选中该模型")
+	}
+	// 面板不再出现「网关先放行 / 上游后恢复」的双时刻。
+	rows := p.ModelLockView()
+	if len(rows) != 1 || !rows[0].UntilAt.IsZero() {
+		t.Errorf("对齐后不应再有 until_at 双时刻: %+v", rows)
+	}
+}
+
+// TestLegacyCappedModelLockRealignedOnLoad 重启加载 state.json 时同样纠偏：
+// 旧文件里的 Until < ResetAt 一启动就对齐到上游墙钟（不必等到下一次选号）。
+func TestLegacyCappedModelLockRealignedOnLoad(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	reset := time.Now().Add(3 * time.Hour).Truncate(time.Second)
+	capped := time.Now().Add(time.Hour).Truncate(time.Second)
+	raw := `{"accounts":{"u1":{"credits":100,"disabled":false,"cool_kind":0,` +
+		`"model_cooldowns":{"glm-5.3":{"until":"` + capped.Format(time.RFC3339) +
+		`","reset_at":"` + reset.Format(time.RFC3339) + `","reason":"6004 model rate limit"}}}}}`
+	if err := os.WriteFile(fp, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	p.mu.RLock()
+	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
+	p.mu.RUnlock()
+	if !ok {
+		t.Fatal("加载后应保留旧条目的模型冷却")
+	}
+	if d := mc.Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Fatalf("加载时应对齐到上游墙钟 %v，得到 %v", reset, mc.Until)
+	}
+}
 // TestRateLimitedModelsProbing Until 已过、ResetAt 未到 → /status 台账仍出一行并标 Probing。
 func TestRateLimitedModelsProbing(t *testing.T) {
 	p := New("")
@@ -108,13 +168,13 @@ func TestModelCooldownProbingSurvivesPrune(t *testing.T) {
 	e.modelCooldowns = map[string]modelCooldown{
 		"glm-5.3": {Until: time.Now().Add(-time.Minute), ResetAt: reset, Reason: "6004 model rate limit"},
 	}
-	e.pruneExpiredModelCooldowns(time.Now())
+	p.pruneExpiredModelCooldownsLocked(e, time.Now())
 	_, kept := e.modelCooldowns["glm-5.3"]
 	if !kept {
 		t.Fatal("Until 到期但 ResetAt 未到：条目必须保留给台账（不得被清理）")
 	}
 	// 上游重置墙钟已过 → 真正过期，清理掉（map 不无限膨胀）。
-	e.pruneExpiredModelCooldowns(reset.Add(time.Second))
+	p.pruneExpiredModelCooldownsLocked(e, reset.Add(time.Second))
 	if _, still := e.modelCooldowns["glm-5.3"]; still {
 		t.Error("ResetAt 已过：条目应被清理")
 	}

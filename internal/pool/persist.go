@@ -197,15 +197,23 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		// 模型级独立冷却（6004 重置墙钟 / 11102 负缓存）：惰性过滤已过期条目。
 		// 过期判据取 displayUntil（max(Until, ResetAt)）：网关提前放行但上游未恢复的
 		// 「放行试探」条目要留住，重启后面板仍能显示该模型还在上游限流到几点。
+		//
+		// 同时对「旧口径遗留」就地纠偏：Until < ResetAt 是旧版按 soft_rate_max 截断写下
+		// 的条目，新口径要求锁到上游恢复时刻 → 加载时重新对齐（只延长不缩短），
+		// 否则重启后那批号仍会提前放行、白撞一次 429（面板也会继续显示两个矛盾的时刻）。
 		if len(s.ModelCooldowns) > 0 {
 			for m, mc := range s.ModelCooldowns {
 				if mc.Until.IsZero() || !now.Before(mc.displayUntil()) {
 					continue
 				}
+				cd := modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
+				if !cd.AuditOnly && !cd.ResetAt.IsZero() && now.Before(cd.ResetAt) && cd.Until.Before(cd.ResetAt) {
+					cd.Until = p.resetHonorUntilLocked(now, cd.ResetAt)
+				}
 				if e.modelCooldowns == nil {
 					e.modelCooldowns = map[string]modelCooldown{}
 				}
-				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
+				e.modelCooldowns[m] = cd
 			}
 		}
 		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
