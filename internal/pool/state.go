@@ -721,7 +721,10 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 // ---------------------------------------------------------------------------
 
 // rateLimitedModelsLocked 收集账号当前仍在限额的模型台账行（issue #36）。
-// modelCooldowns 未到期条目按模型名稳定排序输出；全部到期/空表返回 nil。
+// 展示窗口按 displayUntil（max(Until, ResetAt)）判定：网关按 reset_honor_max 截短
+// 提前放行后、上游重置墙钟未到之前，仍算「上游限流中」，照实出账并标 Probing
+// ——绝不能因为网关提前放行就让整条台账消失（「日志 429、面板可用」的假象）。
+// 按模型名稳定排序输出；全部到期/空表返回 nil。
 // 调用方必须已持有锁（statusOf 只读路径持 RLock，本函数只读不写）。
 func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedModel {
 	if len(e.modelCooldowns) == 0 {
@@ -736,23 +739,31 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 	rows := make([]RateLimitedModel, 0, len(models))
 	for _, m := range models {
 		mc := e.modelCooldowns[m]
-		if !mc.Until.IsZero() && now.Before(mc.Until) {
-			kind := "rate_limit"
-			if strings.HasPrefix(mc.Reason, "11102") {
-				kind = "model_unavailable"
-			}
-			row := RateLimitedModel{
-				Model:  m,
-				Kind:   kind,
-				Until:  mc.Until,
-				Reason: mc.Reason,
-			}
-			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
-			if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
-				row.ResetAt = mc.ResetAt
-			}
-			rows = append(rows, row)
+		displayUntil := mc.displayUntil()
+		if displayUntil.IsZero() || !now.Before(displayUntil) {
+			continue
 		}
+		kind := "rate_limit"
+		if strings.HasPrefix(mc.Reason, "11102") {
+			kind = "model_unavailable"
+		}
+		row := RateLimitedModel{
+			Model:  m,
+			Kind:   kind,
+			Until:  mc.Until,
+			Reason: mc.Reason,
+		}
+		// 网关路由冷却（Until）已过、上游仍称未恢复 → 「已放行试探」：请求照样 429。
+		// 只在 resetHonorMax（荒谬值上限）截短了上游墙钟时出现。
+		if !mc.Until.IsZero() && !now.Before(mc.Until) {
+			row.Probing = true
+			row.GatewayCapSec = int64(p.resetHonorMaxOr().Seconds())
+		}
+		// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
+		if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
+			row.ResetAt = mc.ResetAt
+		}
+		rows = append(rows, row)
 	}
 	if len(rows) == 0 {
 		return nil

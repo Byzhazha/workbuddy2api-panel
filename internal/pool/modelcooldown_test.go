@@ -91,13 +91,15 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	}
 }
 
-// TestCooldownSoftForModelCapsUntilKeepsResetAt 6004 写 modelCooldowns：
-// until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
-func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
+// TestCooldownSoftForModelHonorsResetUntil 6004 写 modelCooldowns：Until 直接采信上游
+// 重置墙钟（不再被 soft_rate_max 截短——用户口径「429 了就别再调用它，直到时间恢复」），
+// ResetAt 记录同一墙钟。
+func TestCooldownSoftForModelHonorsResetUntil(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
+	// soft_rate_max 只影响「无重置时间」的退避路径，这里故意配小，验证它不截断墙钟。
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超封顶 → until 截断到 10m，reset_at 保留 2h
+	reset := time.Now().Add(4 * time.Hour)
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
 	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
@@ -105,11 +107,33 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
 	}
-	if rem := mc.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("Until 应在 (0,10m] 区间，实际剩余 %v", rem)
+	if rem := mc.Until.Sub(time.Now()); rem < 3*time.Hour+50*time.Minute {
+		t.Errorf("Until 应锁到上游重置墙钟（约 4h），实际剩余 %v（不得被 soft_rate_max=10m 截断）", rem)
 	}
 	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("ResetAt=%v want ~2h 后=%v", mc.ResetAt, reset)
+		t.Errorf("ResetAt=%v want ~4h 后=%v", mc.ResetAt, reset)
+	}
+}
+
+// TestCooldownSoftForModelResetHonorMaxCapsAbsurdTime 上游给出荒谬的重置时间（超出
+// reset_honor_max，默认 24h / 此处 10m）时才截断——只防解析错误，不参与正常限流。
+func TestCooldownSoftForModelResetHonorMaxCapsAbsurdTime(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetResetHonorMax(10 * time.Minute)
+	reset := time.Now().Add(72 * time.Hour) // 荒谬：远超上限
+	before := time.Now()
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("want model ledger row: %+v", st.RateLimitedModels)
+	}
+	row := st.RateLimitedModels[0]
+	if row.Until.Sub(before) > 10*time.Minute+time.Second {
+		t.Errorf("Until=%v 应被 reset_honor_max=10m 截断", row.Until)
+	}
+	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("ResetAt=%v 仍应保留上游原始墙钟（%v），供面板显示真实恢复时刻", row.ResetAt, reset)
 	}
 }
 

@@ -308,8 +308,13 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
-// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
+// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）——但有两种例外，见下。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
+//
+// 两条例外（「429 了就别再调用它，直到时间恢复」）：
+//   - pinnedRateCooling：until 来自上游明说的恢复时刻（「将在 … 重置」/Retry-After），
+//     到点前上游一定还是 429 → 兜底也不调（否则白烧一轮轮换 + 一条噪音日志）；
+//   - 该模型仍在上游限流窗口（modelCooled）→ 同上，且这条与账号其余模型无关。
 //
 // 积分保底同样在此生效（model 非空时）：floor 把健康号全部拦掉后 cands 为空会走到
 // 这里，若兜底不看保底，触底号会被「捞回来」继续接收费模型——表现为同一条
@@ -329,6 +334,12 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+		}
+		if e.pinnedRateCooling(now) {
+			continue // 上游已明确恢复时刻：到点前调了必 429，不做无谓探测
+		}
+		if model != "" && e.modelCooled(now, model) {
+			continue // 该模型仍在上游限流窗口：兜底也不调（账号其余模型不受影响）
 		}
 		if p.floorBlockedForRealmModel(e, model, realm, now) {
 			continue // 积分保底：触底号不接收费模型（兜底路径同判据）

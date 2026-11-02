@@ -23,16 +23,24 @@ type ModelLockRow struct {
 	Total int `json:"total"`
 	// Servable 此刻真正能服务该模型的账号数（healthyForModel 且未在途占满）。
 	Servable int `json:"servable"`
-	// Locked 因该模型自身冷却被挡的账号数。
+	// Locked 因该模型自身冷却被挡的账号数（含 Probing 部分：对上游而言这些号
+	// 此刻调该模型照样 429，不能算「能用」）。
 	Locked int `json:"locked"`
+	// Probing 其中「网关按 reset_honor_max 截短冷却放行、上游仍称未恢复」的账号数
+	// （Locked 的子集）。Probing == Locked 时状态为 probing：网关会重试，但仍会 429。
+	Probing int `json:"probing,omitempty"`
 	// State 聚合状态：
 	//   - locked  ：全部参与选号的账号都被该模型冷却挡住（换模型或等解锁才有用，
 	//               与 ModelBlocked 的 Blocked 同口径）；
 	//   - starved ：此刻没有号能服务，但不是模型冷却造成的（账号级冷却/熔断/在途占满）
 	//               ——等一下就会好，与模型无关；
+	//   - probing ：没有任何号还被网关冷却挡着，但上游重置墙钟未到（网关封顶提前
+	//               放行）——此刻的请求仍会 429，只是面板不再假装它「能用了」；
 	//   - partial ：仍有号能服务该模型，只是部分号被锁。
 	State string `json:"state"`
 	// UnlockAt 最早解锁时刻：第一个被锁账号恢复的时刻（partial 下「何时值得重试」）。
+	// 口径取 displayUntil（max(Until, ResetAt)）：网关封顶放行但上游未恢复时，
+	// 「值得重试」的真正时刻是上游重置墙钟，而不是网关放行的那一秒。
 	UnlockAt time.Time `json:"unlock_at"`
 	// FullyUnlockAt 全部解锁时刻：最后一个被锁账号恢复的时刻。
 	FullyUnlockAt time.Time `json:"fully_unlock_at"`
@@ -47,12 +55,16 @@ type ModelLockRow struct {
 // 失败后的单模型回答；运维仍看不到「此刻一共哪些模型不能用、分别还要锁多久」。
 // 本视图把 (域, 模型) 维度聚合成一张清单补齐这一点。
 //
-// 口径与选号/ModelBlocked 严格一致，三处易错点：
+// 口径与选号/ModelBlocked 基本一致，四处易错点：
 //   - 只看**参与选号**的账号：disabled / paused 号跳过——它们的不可用与模型无关，
 //     计进来会把「模型被锁」和「号被停了」混为一谈；
 //   - 只看**真正拦路由**的冷却：AuditOnly 台账（无重置时间的 6004）不改变选号，
 //     既不产生行也不计入 Locked；
-//   - 已过期的冷却不算锁。
+//   - 锁窗口取 displayUntil（max(Until, ResetAt)）：网关按 reset_honor_max 截短提前
+//     放行、上游仍称未恢复的号照样 429，不能因为「网关放行了」就从本表消失
+//     （那是 issue「日志 429、面板可用」的根因）；这类号计入 Probing；
+//   - Servable 剔除 displayLimited 的号：必 429 的号不能当「还能服务」的证据。
+//     已真正过期的冷却（displayUntil 已到）仍不算锁。
 //
 // 只读：持 RLock 遍历，不改任何状态。无锁时返回 nil（JSON 里是 null，面板按空态渲染）。
 func (p *Pool) ModelLockView() []ModelLockRow {
@@ -61,10 +73,11 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 	now := time.Now()
 
 	type agg struct {
-		locked   int
-		unlockAt time.Time
-		fullyAt  time.Time
-		reason   string
+		locked      int       // 台账意义上的锁（displayUntil 未到）
+		probing     int       // 其中网关已放行、上游未恢复的（Until 已过）
+		unlockAt    time.Time // displayUntil 最早
+		fullyAt     time.Time // displayUntil 最晚
+		reason      string
 	}
 	rows := make(map[string]*agg)
 	routable := make(map[string]int) // realm → 参与选号的账号数
@@ -76,7 +89,11 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 		}
 		routable[realm]++
 		for model, mc := range e.modelCooldowns {
-			if mc.AuditOnly || mc.Until.IsZero() || !now.Before(mc.Until) {
+			// 展示窗口 = displayUntil（max(Until, ResetAt)）：网关按 reset_honor_max
+			// 封顶提前放行后，只要上游重置墙钟未到，这个号对这个模型照样 429，
+			// 必须继续算「不能用」，否则面板会把一个必错的模型报成可用。
+			displayUntil := mc.displayUntil()
+			if mc.AuditOnly || displayUntil.IsZero() || !now.Before(displayUntil) {
 				continue
 			}
 			key := realm + "\x1f" + model
@@ -86,12 +103,15 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 				rows[key] = a
 			}
 			a.locked++
-			if a.unlockAt.IsZero() || mc.Until.Before(a.unlockAt) {
-				a.unlockAt = mc.Until
+			if mc.Until.IsZero() || !now.Before(mc.Until) {
+				a.probing++
+			}
+			if a.unlockAt.IsZero() || displayUntil.Before(a.unlockAt) {
+				a.unlockAt = displayUntil
 				a.reason = mc.Reason
 			}
-			if a.fullyAt.IsZero() || mc.Until.After(a.fullyAt) {
-				a.fullyAt = mc.Until
+			if a.fullyAt.IsZero() || displayUntil.After(a.fullyAt) {
+				a.fullyAt = displayUntil
 			}
 		}
 	}
@@ -108,6 +128,7 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 			Realm:         realm,
 			Total:         routable[realm],
 			Locked:        a.locked,
+			Probing:       a.probing,
 			UnlockAt:      a.unlockAt,
 			FullyUnlockAt: a.fullyAt,
 			Reason:        a.reason,
@@ -116,13 +137,19 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 			if e.a.Realm() != realm {
 				continue
 			}
-			if e.healthyForModel(now, model) && !p.inFlightFull(e) {
+			// Servable 只数「真能服务」的号：healthyForModel 用的是路由口径
+			// （Until），网关已放行但上游仍限流的号必须先剔掉，否则会把
+			// 「必 429 的号」算成可用证明（那是本视图最容易自欺的一处）。
+			if e.healthyForModel(now, model) && !e.displayLimited(now, model) && !p.inFlightFull(e) {
 				row.Servable++
 			}
 		}
 		switch {
 		case row.Servable > 0:
 			row.State = "partial"
+		case row.Probing >= row.Locked:
+			// 没有任何号还被网关冷却挡着，但上游重置墙钟未到：网关会重试，仍会 429。
+			row.State = "probing"
 		case row.Locked >= row.Total:
 			// 参与选号的号全被这个模型挡住 —— 与 ModelBlocked 的 Blocked 同义。
 			row.State = "locked"
@@ -138,8 +165,10 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 			return 0
 		case "starved":
 			return 1
-		default:
+		case "probing":
 			return 2
+		default:
+			return 3
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {

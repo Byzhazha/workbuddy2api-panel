@@ -892,20 +892,25 @@ func TestCooldownSoftForModelParsedUntil(t *testing.T) {
 	}
 }
 
-func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
-	// 解析时间超出 soft_rate_max → 截断到 soft_rate_max（不无限期拉黑）。
+func TestCooldownSoftForModelIgnoresSoftRateMax(t *testing.T) {
+	// 解析时间不再被 soft_rate_max 截断：429 就锁到上游说的恢复时刻
+	// （用户口径「429 了就别再调用它，直到时间恢复」）。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超过封顶 10m
+	reset := time.Now().Add(2 * time.Hour)
 	before := time.Now()
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
 	st, _ := p.Status("u1")
 	if len(st.RateLimitedModels) != 1 {
 		t.Fatalf("want model ledger row: %+v", st.RateLimitedModels)
 	}
-	if st.RateLimitedModels[0].Until.Sub(before) > 10*time.Minute+time.Second {
-		t.Errorf("model until=%v want capped at soft_rate_max=10m", st.RateLimitedModels[0].Until)
+	if rem := st.RateLimitedModels[0].Until.Sub(before); rem < 110*time.Minute {
+		t.Errorf("model until 应锁到上游墙钟（约 2h），实际 %v（soft_rate_max 不得截断）", rem)
+	}
+	// 路由侧同样锁满：窗口内同模型请求不会选中该号。
+	if got := p.PickExcludingForModel(nil, "glm-5.3"); got != nil && got.UID == "u1" {
+		t.Error("冷却窗口内不得再调用该号的该模型")
 	}
 }
 

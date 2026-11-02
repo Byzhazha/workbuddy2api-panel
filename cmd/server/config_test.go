@@ -157,6 +157,10 @@ func TestNewPoolConfigDefaults(t *testing.T) {
 	if c.SoftRateMaxDur.Hours() != 2 {
 		t.Errorf("soft_rate_max=%v want 2h", c.SoftRateMaxDur)
 	}
+	// 上游重置墙钟采信上限默认 24h：只拦荒谬时间，正常限流锁到上游说的时刻。
+	if c.ResetHonorMaxDur.Hours() != 24 {
+		t.Errorf("reset_honor_max=%v want 24h", c.ResetHonorMaxDur)
+	}
 	if !c.SessionSticky.Enabled {
 		t.Error("session_sticky.enabled want true")
 	}
@@ -274,6 +278,41 @@ func TestBadSoftRateMax(t *testing.T) {
 	os.WriteFile(fp, []byte(`{"cooldown":{"soft_rate_max":"oops"}}`), 0o600)
 	if _, err := Load(fp); err == nil {
 		t.Fatal("want error for bad soft_rate_max")
+	}
+}
+
+// TestResetHonorMaxParsedFromFile reset_honor_max（上游重置墙钟采信上限）可配、可回落、
+// 非法值报错——它只管「荒谬时间」上限，正常限流锁到上游说的时刻。
+func TestResetHonorMaxParsedFromFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"cooldown":{"reset_honor_max":"4h"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ResetHonorMaxDur.Hours() != 4 {
+		t.Errorf("reset_honor_max=%v want 4h", c.ResetHonorMaxDur)
+	}
+
+	// 键缺席 → 默认 24h。
+	fp2 := filepath.Join(dir, "c2.json")
+	os.WriteFile(fp2, []byte(`{"cooldown":{"soft_rate":"90s"}}`), 0o600)
+	c2, err := Load(fp2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.ResetHonorMaxDur.Hours() != 24 {
+		t.Errorf("reset_honor_max=%v want 24h 默认", c2.ResetHonorMaxDur)
+	}
+
+	// 非法值/非正值报错（0 会让所有 429 立即放行，等于关掉限流保护）。
+	for _, bad := range []string{"oops", "0s", "-1h"} {
+		fp3 := filepath.Join(dir, "c3.json")
+		os.WriteFile(fp3, []byte(`{"cooldown":{"reset_honor_max":"`+bad+`"}}`), 0o600)
+		if _, err := Load(fp3); err == nil {
+			t.Errorf("reset_honor_max=%q 应报错", bad)
+		}
 	}
 }
 

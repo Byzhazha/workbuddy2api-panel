@@ -264,11 +264,21 @@ function rateLimitMeta(row, now) {
     };
   }
   const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
-  if (until && resetAt && until < resetAt) {
-    // 双时钟（issue #171 问题二）：黄框出现/消失由 until 决定（网关为防超长
-    // 限流拖死全池，把重试封顶在 now+softRateMax），主文字却按 resetAt 显示，
-    // 导致「写的解封时间」与「实际掉框时刻」不一致。此时主文字同时明示两个
-    // 时刻与口径，倒计时跟随 until（与实际掉框一致，也与「模型与档位」页
+  const probing = !!(row && row.probing);
+  const capSec = Number((row && row.gateway_cap_sec) || 0) || 0;
+  let detail;
+  if (probing) {
+    // 网关按 reset_honor_max 截短冷却提前放行，但上游「将在 … 重置」的墙钟未到：
+    // 此刻请求该模型照样 429。必须照实画出来，不能让整条台账消失
+    // （否则就是「日志一直 429、面板却说可用」）。
+    detail = '网关已放行' + (capSec ? '（上限 ' + dur(capSec) + '）' : '') +
+      (resetAt ? ' · 上游称 ' + fmtLocalDateTime(resetAt) + ' 恢复' : ' · 上游恢复时间未知');
+    title.push('网关路由冷却已到期放行（受 cooldown.reset_honor_max' + (capSec ? ' ' + dur(capSec) : '') + ' 截短），' +
+      '但上游重置墙钟未到：请求该模型仍会 429');
+  } else if (until && resetAt && until < resetAt) {
+    // 双时钟（issue #171 问题二）：until < resetAt 只在「上游重置时间超出
+    // cooldown.reset_honor_max（默认 24h）荒谬值上限」时出现。此时主文字同时明示
+    // 两个时刻与口径，倒计时跟随 until（与实际掉框一致，也与「模型与档位」页
     // 锁池表的 until 口径对齐）。
     const retryIn = until > now ? Math.round((until - now) / 1000) : 0;
     detail = '网关 ' + fmtLocalDateTime(until) + ' 起重试' + (retryIn ? '（剩余 ' + dur(retryIn) + '）' : '') +
@@ -399,7 +409,16 @@ function renderAccounts(list) {
       const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
-    } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
+    } else {
+      // 账号本身可服务（模型级限流不锁号），但只要有模型还在上游限流窗口里，
+      // 状态列就不能只显示「可用」——否则运维看到日志刷 429 会以为面板瞎了。
+      const limited = (s.rate_limited_models || []).filter(r => r && r.model);
+      tag = '<span class="tag ok">可用</span>' +
+        (limited.length
+          ? ' <span class="tag warn" title="该账号可用，但下列模型仍在上游限流中（见下方黄框与「模型锁池」）：' +
+            esc(limited.map(r => r.model).join('、')) + '">限流 ' + limited.length + '</span>'
+          : '');
+    }
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
@@ -476,7 +495,7 @@ function renderModelLocks(rows) {
     if (note) note.textContent = '';
     return;
   }
-  const STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], partial: ['warn', '部分限流'] };
+  const STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], probing: ['warn', '已放行·仍 429'], partial: ['warn', '部分限流'] };
   const left = iso => {
     const ms = parseAPITime(iso);
     return ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '—';
@@ -489,7 +508,8 @@ function renderModelLocks(rows) {
       '<td><span class="realm-tag">' + realm + '</span></td>' +
       '<td><span class="tag ' + st[0] + '">' + st[1] + '</span></td>' +
       '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
-      '<td class="num">' + (r.locked || 0) + '</td>' +
+      '<td class="num">' + (r.locked || 0) + (r.probing
+        ? '<div class="note" style="color:var(--ink-3)">其中 ' + r.probing + ' 已放行</div>' : '') + '</td>' +
       '<td class="num">' + left(r.unlock_at || r.fully_unlock_at) + '</td>' +
       '<td class="num">' + left(r.fully_unlock_at) + '</td>' +
       '<td>' + (r.reason ? '<div class="note">' + esc(r.reason) + '</div>' : '—') + '</td>' +
@@ -497,7 +517,10 @@ function renderModelLocks(rows) {
   }).join('');
   if (note) {
     const bad = rows.filter(r => r.state === 'locked' || r.state === 'starved').length;
-    note.textContent = bad ? bad + ' 个模型整池不可用' : rows.length + ' 个模型部分限流';
+    const probing = rows.filter(r => r.state === 'probing').length;
+    note.textContent = bad ? bad + ' 个模型整池不可用'
+      : probing ? probing + ' 个模型上游仍限流（网关已放行试探，请求仍会 429）'
+      : rows.length + ' 个模型部分限流';
   }
 }
 
@@ -749,6 +772,13 @@ function mdAvailabilityOf(m, locks, recent) {
     if (lock.state === 'starved') {
       return { key: 'starved', label: '账号暂不可用', cls: 'mute',
         tip: '没有账号能服务该模型，但并非该模型自身被锁；请检查账号冷却/在途占用' };
+    }
+    if (lock.state === 'probing') {
+      // 网关按 soft_rate_max 封顶提前放行了，上游墙钟未到：请求仍会 429。
+      const unlockAt = parseAPITime(lock.fully_unlock_at || lock.unlock_at);
+      return { key: 'probing', label: '上游限流中', cls: 'warn',
+        tip: '网关已放行试探，但上游仍未恢复' + (unlockAt ? '（' + fmtLocalDateTime(unlockAt) + ' 才恢复）' : '') +
+          '；此刻请求该模型仍会 429' + (reason ? '；' + reason : '') };
     }
     if (lower.startsWith('11158') || lower.includes('not allowed for user type')) {
       return { key: 'denied', label: '无权限', cls: 'bad',
@@ -1146,6 +1176,7 @@ const CFG_MAP = {
   credit_floor: ['pool', 'credit_floor'],
   prefer_expiring: ['pool', 'prefer_expiring'], expiring_soon: ['pool', 'expiring_soon'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
+  reset_honor_max: ['cooldown', 'reset_honor_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
   ttl: ['session_sticky', 'ttl'],
@@ -1219,7 +1250,7 @@ function collectConfig() {
    config.go normalize() 的 time.ParseDuration 同口径，脏值在前端就地标红，
    不再等到保存被拒。 */
 const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
-const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
+const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'reset_honor_max', 'breaker_cooldown', 'breaker_cooldown_max',
   'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl'];
 const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 function durationBad(name) {

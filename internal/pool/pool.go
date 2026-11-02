@@ -24,7 +24,13 @@ type Pool struct {
 	breakerCooldown    time.Duration
 	breakerCooldownMax time.Duration
 	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
+	// 只作用于「上游没给重置时间」的有界退避路径。
 	softRateMax time.Duration
+	// resetHonorMax 上游「将在 … 重置」墙钟的采信上限（SetResetHonorMax 注入；默认
+	// defaultResetHonorMax 24h）。有重置时间的 429 一律锁到该墙钟（不再被 soft_rate_max
+	// 截断）——截断的代价是「到期提前放行 → 立刻再撞一次 429 → 日志刷屏」，且面板上
+	// 写的时间和真实恢复时间对不上。上限只用于拦上游给出的荒谬时间（如年份写错）。
+	resetHonorMax time.Duration
 	// costExploreInterval costTier 条件探索窗口（issue #136 方案 a′，SetCostExploreInterval
 	// 注入；默认 defaultCostExploreInterval 30m）。tier 0 垄断 + tier 1 存在且距上次
 	// 探索 ≥ 窗口时，本次 pick 生效层切 tier 1-only（探索=搭车改道，零新增上游请求）。
@@ -156,11 +162,22 @@ func (p *Pool) SetBreaker(threshold int, cooldown, cooldownMax time.Duration) {
 
 // SetSoftRateMax 注入软冷却指数退避的封顶时长（main 从 config 解析后调用）。
 // 非正值保留原值（用默认 2h），风格同 SetBreaker。
+// 注意：只管「上游没给重置时间」的退避路径；带重置时间的 429 由 SetResetHonorMax 管。
 func (p *Pool) SetSoftRateMax(d time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if d > 0 {
 		p.softRateMax = d
+	}
+}
+
+// SetResetHonorMax 注入「上游重置墙钟」的采信上限（main 从 config 解析后调用）。
+// 非正值保留原值（用默认 24h），风格同 SetSoftRateMax。
+func (p *Pool) SetResetHonorMax(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d > 0 {
+		p.resetHonorMax = d
 	}
 }
 

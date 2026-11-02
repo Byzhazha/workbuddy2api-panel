@@ -152,9 +152,18 @@ type RateLimitedModel struct {
 	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
 	// 多模型限流时不再等于 Status.Until（账号级）。
 	Until time.Time `json:"until,omitempty"`
-	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）；
+	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 reset_honor_max 荒谬值上限截断）；
 	// 截断后 Until==ResetAt 时省略 ResetAt 让台账自然减少一列。
 	ResetAt time.Time `json:"reset_at,omitempty"`
+	// Probing 网关侧冷却（Until）已到期放行、上游重置墙钟（ResetAt）还没到：
+	// 该模型此刻照样会 429，只是网关按 reset_honor_max 的荒谬值上限截短了冷却。
+	// 面板据此把「已放行但还没恢复」如实画出来，而不是让整条台账消失
+	// （否则表现就是「日志一直 429、面板却说可用」）。
+	Probing bool `json:"probing,omitempty"`
+	// GatewayCapSec 当前 cooldown.reset_honor_max 的秒数（仅 Probing 时输出）：
+	// 只有上游给的重置时间超出这个上限才会出现 Probing——运维据此判断
+	// 「是上游给了个荒谬时间」还是「配置把上限压得太低」。
+	GatewayCapSec int64 `json:"gateway_cap_sec,omitempty"`
 	// Reason 触发原因（运维可读文案）。
 	Reason string `json:"reason,omitempty"`
 }
@@ -165,9 +174,9 @@ type RateLimitedModel struct {
 //   - 11102 该后端无此模型：Until 为指数退避 TTL（6h 起、封顶 24h）；Hits 记录
 //     累计命中次数驱动退避（6004 无 hits 概念，Hits 恒 0）。
 type modelCooldown struct {
-	// Until 该模型的冷却截止（6004：now+min(resetAt-now, soft_rate_max)；11102：now+退避 TTL）。
+	// Until 该模型的冷却截止（6004：now+min(resetAt-now, reset_honor_max)；11102：now+退避 TTL）。
 	Until time.Time
-	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）。
+	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 reset_honor_max 荒谬值上限截断）。
 	// 与 Until 的区别同：Until 可能截断，ResetAt 是上游权威恢复时刻。
 	// 11102 无重置文案，ResetAt 恒零值。
 	ResetAt time.Time
@@ -178,6 +187,28 @@ type modelCooldown struct {
 	// AuditOnly 为 true 时仅用于状态展示（例如无重置时间的 6004），
 	// healthyForModel 与 modelExempt 必须忽略它，避免改变选号行为。
 	AuditOnly bool
+}
+
+// displayUntil 返回该条模型级冷却的**台账/展示**截止时刻 = max(Until, ResetAt)。
+//
+// 两个时钟分工严格：
+//   - Until 是**路由口径**（选号回避的截止）：正常情况下就等于上游墙钟，只有上游给了荒谬
+//   - ResetAt 是上游「将在 … 重置」的权威恢复墙钟，可能还在数小时后。
+//
+// 展示侧必须取较晚者：否则网关一按封顶提前放行，台账整条就消失，运维看到的是
+// 「日志一直在刷 429，面板却说可用」——这正是旧实现按 soft_rate_max 提前放行的表现。
+// 本方法只服务台账/锁池，绝不参与 healthyForModel（选号仍只看 Until）。
+func (mc modelCooldown) displayUntil() time.Time {
+	return displayUntilOf(mc.Until, mc.ResetAt)
+}
+
+// displayUntilOf 是 displayUntil 的共享实现（运行态与持久化记录同一口径，
+// 避免落盘/恢复两侧各写一遍比较逻辑而漂移）。
+func displayUntilOf(until, resetAt time.Time) time.Time {
+	if resetAt.After(until) {
+		return resetAt
+	}
+	return until
 }
 
 // modelCostTTL 成本观测的有效期。取 6 小时：既覆盖"夜间免费"这类时段性优惠的
@@ -215,6 +246,13 @@ type entry struct {
 	lastCheckinDay string
 	coolKind       CoolKind
 	until          time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	// resetPinned 当前 until 是不是**上游明说的恢复时刻**（「将在 … 重置」/Retry-After），
+	// 而不是本地退避估算。两者的兜底待遇不同：
+	//   - pinned（上游权威）：到点前上游一定还 429，连「全冷却兜底」都不该调它
+	//     ——调了只是白烧一轮轮换 + 一条噪音日志（用户口径：429 就别再调用，直到恢复）；
+	//   - 估算（soft_rate 退避 / 熔断 / 连败降权）：本地推断，允许半开探测（可能已恢复）。
+	// 只在持 p.mu 时读写；不持久化（重启后冷却本身可重算）。
+	resetPinned bool
 	disabled       bool
 	// paused 暂停选号：与 disabled 正交。置位后退出选号候选（healthy 判否），
 	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
@@ -287,6 +325,15 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 	return mc, true
 }
 
+// pinnedRateCooling 报告账号是否正处于「上游已明确恢复时刻」的 429 冷却期
+// （until 来自上游墙钟/Retry-After，且还没到点）。
+//
+// 用途：全冷却兜底（pickEarliestExpiryLocked）用它挡掉这类账号——上游说了「这一刻前
+// 别来」，再去调只是必然一次的 429。熔断/连败降权/退避估算仍允许半开探测。
+func (e *entry) pinnedRateCooling(now time.Time) bool {
+	return e.resetPinned && e.coolKind == CoolSoft && !e.until.IsZero() && now.Before(e.until)
+}
+
 // healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断/连败降权期）。
 // 连败降权与冷却/熔断同入本判定（取更长者不叠加：三个截止是并列的或门，
 // 只要任一未到期即不可选，天然「并存取更远者」——不需要显式比较长短）。
@@ -334,6 +381,26 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 		return false
 	}
 	return !mc.Until.IsZero() && now.Before(mc.Until)
+}
+
+// displayLimited 报告该账号该模型是否仍在**上游限流展示窗口**内
+// （now < displayUntil，即 Until 或 ResetAt 中较晚者未到）。
+//
+// 与 modelCooled 的分工：modelCooled 是路由口径（只看 Until，决定「要不要回避这个
+// 模型」）；本方法只在台账/锁池侧使用，回答「面板还要不要提示这个模型被限流」。
+// 网关按 reset_honor_max 截短冷却提前放行后，Until 已过但上游仍未恢复时本方法仍为 true——
+// 这些请求照样会 429，面板必须照实展示（否则就是「日志 429、面板可用」的假象）。
+// AuditOnly（无重置时间的 6004）不算限流窗口，与 modelCooled 同口径。
+func (e *entry) displayLimited(now time.Time, model string) bool {
+	if model == "" {
+		return false
+	}
+	mc, ok := e.modelCooldowns[model]
+	if !ok || mc.AuditOnly {
+		return false
+	}
+	du := mc.displayUntil()
+	return !du.IsZero() && now.Before(du)
 }
 
 // healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
@@ -386,12 +453,16 @@ func (e *entry) pruneExpiredModelCosts(now time.Time) {
 // pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
 // pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项，
 // 无需清理。调用方必须已持有 p.mu 写锁。
+//
+// 过期判据取 displayUntil（max(Until, ResetAt)）而非 Until：网关提前放行后、
+// 上游重置墙钟未到之前，条目仍要留给台账/锁池展示（面板要显示「这个模型还在
+// 上游限流、几点恢复」），此时 route 侧已由 Until 自然放行，留着不改变选号行为。
 func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 	if len(e.modelCooldowns) == 0 {
 		return
 	}
 	for m, mc := range e.modelCooldowns {
-		if mc.Until.IsZero() || !now.Before(mc.Until) {
+		if mc.Until.IsZero() || !now.Before(mc.displayUntil()) {
 			delete(e.modelCooldowns, m)
 		}
 	}
@@ -503,6 +574,11 @@ type stateModelCooldown struct {
 	AuditOnly bool      `json:"audit_only,omitempty"`
 }
 
+// displayUntil 与 modelCooldown.displayUntil 同口径（落盘/恢复侧共用同一比较逻辑）。
+func (mc stateModelCooldown) displayUntil() time.Time {
+	return displayUntilOf(mc.Until, mc.ResetAt)
+}
+
 // stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry
 // 同构（单一表示，内存与落盘不搞两套）。
 type stateModelCost struct {
@@ -527,6 +603,13 @@ const (
 // defaultSoftRateMax 软冷却指数退避的默认封顶：softRateMax 未注入（<=0）时按此值算，
 // 避免测试/裸用池时退避无上限。
 const defaultSoftRateMax = 2 * time.Hour
+
+// defaultResetHonorMax 上游重置墙钟的默认采信上限：resetHonorMax 未注入（<=0）时按此值算。
+//
+// 取 24h（而不是 soft_rate_max 的 2h）：带「将在 … 重置」的 429 一律锁到上游说的时刻，
+// 否则网关提前放行 → 下一个请求白打一次 429 → 日志刷屏、面板时间对不上。24h 只用于
+// 拦住年份写错/文案解析出荒谬时间这类情况，正常限流（几十分钟~几小时）全部原样采信。
+const defaultResetHonorMax = 24 * time.Hour
 
 // defaultDegrade* 连败降权默认参数（issue #114）：连败 5 次临时出池 10 分钟。
 const (

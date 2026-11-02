@@ -1466,13 +1466,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
 				return
 			}
-			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
+			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, softRateReason("429 rate limit", model))
 			return
 		}
 		// body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加）。
 		// 头优先于「有界退避」，但低于 body 重置文案（文案是上游更权威的口径）。
 		if uerr != nil && uerr.RetryAfter > 0 {
-			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
+			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), softRateReason("429 rate limit (retry-after)", model))
 			if modelRateLimited {
 				h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
 			}
@@ -1481,7 +1481,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
 		// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
 		// （热改优先），管理面板改 soft_rate 后立即生效。
-		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
+		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, softRateReason("429 rate limit", model))
 		if modelRateLimited {
 			h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
 		}
@@ -1589,6 +1589,19 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 // （账号本身健康），但比 404 重（带粘性会连环）；60s 级的快速避让已足够让频控窗口
 // 滑过。抖动复用 backoff.go jitterDur（单一来源）。
 const wafCooldownBase = 60 * time.Second
+
+// softRateReason 账号级限流冷却的 reason 文案：附上本次请求的模型名。
+//
+// 为什么要带模型名：账号级 429（非 6004 / 无模型级语义的限流）不产生 modelCooldowns
+// 台账，状态里只剩一条「429 rate limit」，面板「原因」一栏等于什么信息都没有——
+// 运维看到 429 想知道「哪个模型撞的」只能去翻日志。模型级 6004 走台账（自带 Model
+// 字段），本函数只补账号级这一路的可观测性。
+func softRateReason(base, model string) string {
+	if model == "" {
+		return base
+	}
+	return base + " · " + model
+}
 
 // writeOpenAIErrorHint 同 writeOpenAIError，另在 error 对象上附加
 // error.gateway_hint（hint 为空串时不带字段——未覆盖形态不编造）。

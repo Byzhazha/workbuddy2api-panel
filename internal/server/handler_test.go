@@ -792,6 +792,106 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	}
 }
 
+// TestChat6004ResetFarBeyondCapKeepsLedgerVisible 上游重置墙钟远在 soft_rate_max 之外
+// （此处封顶 50ms）→ 网关秒级放行、上游仍称几小时后才恢复：/status 台账必须继续可见
+// 并标 Probing（含上游重置时刻与封顶秒数）。
+//
+// 端到端回归的正是用户的原始疑问「日志都 429 了，面板怎么还显示可用」：模型级 6004
+// 只锁模型不锁号是既定语义（账号对别的模型仍可用），但「网关按封顶提前放行」绝不能让
+// 台账整条消失——一消失，面板上就只剩「可用」，而日志还在刷 429。
+func TestChat6004ResetFarBeyondCapKeepsLedgerVisible(t *testing.T) {
+	reset := time.Now().Add(4 * time.Hour)
+	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	p.SetResetHonorMax(50 * time.Millisecond) // 极小上限：复现「网关已放行、上游数小时未恢复」
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+	}
+
+	time.Sleep(80 * time.Millisecond) // 越过网关封顶（Until 到期），上游墙钟远未到
+
+	st, _ := p.Status("bad")
+	if st.Cooling {
+		t.Fatalf("模型级 6004 不得把账号级冷却置真（账号对别的模型仍可用）: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("网关放行后、上游未恢复前台账必须仍在（否则面板看不见 429）: %+v", st.RateLimitedModels)
+	}
+	row := st.RateLimitedModels[0]
+	if row.Model != "glm-5.3" || row.Kind != "rate_limit" {
+		t.Errorf("row = %+v want glm-5.3/rate_limit（面板要显示具体模型）", row)
+	}
+	if !row.Probing {
+		t.Errorf("Until 已过、ResetAt 未到应标 probing: %+v", row)
+	}
+	if row.GatewayCapSec != 0 {
+		// 50ms 的封顶不足 1s，Seconds() 取整为 0：允许 0（面板文案会省掉封顶时长），
+		// 但绝不能是 2h 之类的默认值——那说明取的不是「生效配置」。
+		t.Logf("gateway_cap_sec=%d（<1s 封顶取整为 0，可接受）", row.GatewayCapSec)
+	}
+	if d := row.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("reset_at = %v want ~%v（面板要显示上游确认的恢复时刻）", row.ResetAt, reset)
+	}
+
+	// 路由侧确实已放行（正因如此日志才会一直刷 429）：这是展示缺口，不是选号问题。
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil {
+		t.Fatal("Until 到期后应至少有一个号可被选中（放行试探）")
+	}
+}
+
+// TestChatAllPinned429FailsFastWithoutUpstreamCall 全池都处在「上游已明确恢复时刻」的
+// 429 冷却里（这里是账号级 429 + 重置墙钟）→ 直接 503 no_healthy_account，**一次上游
+// 请求都不发**（用户口径：429 了就不要再调用它，直到时间恢复）。
+//
+// 与「熔断/退避估算」的区别：那些是本地推断，兜底仍允许半开探测；上游给了墙钟就是
+// 承诺，到点前调了必 429（旧实现按 soft_rate_max 截断提前放行 → 日志刷屏）。
+func TestChatAllPinned429FailsFastWithoutUpstreamCall(t *testing.T) {
+	var calls atomic.Int32
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls.Add(1)
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "a1", AccessToken: "at-a1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "a2", AccessToken: "at-a2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("a1", 1000, 0)
+	p.SetCredits("a2", 1000, 0)
+	// 上游说两小时后才恢复：账号级 429（非 6004，不产生切模型豁免）。
+	p.CooldownSoftRate("a1", 600*time.Second, time.Now().Add(2*time.Hour), "429 rate limit · glm-5.3")
+	p.CooldownSoftRate("a2", 600*time.Second, time.Now().Add(2*time.Hour), "429 rate limit · glm-5.3")
+
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[]}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d want 503 body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "no_healthy_account") {
+		t.Errorf("body=%s want no_healthy_account", rec.Body.String())
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("上游请求数=%d want 0（恢复时刻未到，不该再打 429）", n)
+	}
+}
+
 // TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 退回 600s 基数软冷却
 // （现状不变）。
 func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {

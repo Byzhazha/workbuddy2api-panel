@@ -195,9 +195,11 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			e.degradeUntil = *s.DegradeUntil
 		}
 		// 模型级独立冷却（6004 重置墙钟 / 11102 负缓存）：惰性过滤已过期条目。
+		// 过期判据取 displayUntil（max(Until, ResetAt)）：网关提前放行但上游未恢复的
+		// 「放行试探」条目要留住，重启后面板仍能显示该模型还在上游限流到几点。
 		if len(s.ModelCooldowns) > 0 {
 			for m, mc := range s.ModelCooldowns {
-				if mc.Until.IsZero() || !now.Before(mc.Until) {
+				if mc.Until.IsZero() || !now.Before(mc.displayUntil()) {
 					continue
 				}
 				if e.modelCooldowns == nil {
@@ -328,9 +330,11 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			s.DegradeUntil = &u
 		}
 		// 模型级独立冷却：惰性过滤已过期条目（Hits 不落盘，重启后 11102 退避从基数重学）。
+		// 过期判据同恢复侧取 displayUntil（max(Until, ResetAt)）：上游限流墙钟未到的
+		// 「放行试探」条目继续落盘，重启后仍能在面板上看到「哪个模型限流到几点」。
 		if len(e.modelCooldowns) > 0 {
 			for m, mc := range e.modelCooldowns {
-				if mc.Until.IsZero() || !now.Before(mc.Until) {
+				if mc.Until.IsZero() || !now.Before(mc.displayUntil()) {
 					continue
 				}
 				if s.ModelCooldowns == nil {

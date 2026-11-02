@@ -64,7 +64,16 @@ type Config struct {
 		SoftRate string `json:"soft_rate"` // "600s"，软限流冷却基数
 		// SoftRateMax 软冷却指数退避的封顶，默认 "2h"。
 		// 空值回落默认，非法值报错（处理风格同 soft_rate）。
+		// 只作用于「上游没给重置时间」的有界退避路径。
 		SoftRateMax string `json:"soft_rate_max"` // "2h"
+		// ResetHonorMax 上游「将在 … 重置」墙钟的采信上限，默认 "24h"。
+		//
+		// 带重置时间的 429（6004 模型级 / 账号级限流）一律锁到上游说的那一刻，**不**按
+		// soft_rate_max 提前放行：提前放行只会让下一个请求白撞一次 429（日志刷屏、
+		// 面板写的恢复时间和真实恢复时间对不上）。本键只防「上游给出荒谬时间」
+		// （年份写错/文案解析越界），正常限流（几十分钟~几小时）全部原样采信。
+		// 空值回落默认，非法值报错。
+		ResetHonorMax string `json:"reset_honor_max"` // "24h"
 	} `json:"cooldown"`
 
 	Schedule struct {
@@ -256,6 +265,8 @@ type Config struct {
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
+	// ResetHonorMaxDur 解析后的上游重置墙钟采信上限（默认 24h）。
+	ResetHonorMaxDur       time.Duration `json:"-"`
 	BreakerCooldownDur     time.Duration `json:"-"`
 	BreakerCooldownMaxD    time.Duration `json:"-"`
 	DegradeCooldownDur     time.Duration `json:"-"`
@@ -281,6 +292,7 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
+	c.Cooldown.ResetHonorMax = "24h"
 	c.Server.ReadTimeout = "300s"
 	c.Panel.PackageDetailLimit = 5
 	c.Logging.RequestArchiveEnabled = true
@@ -437,6 +449,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SOFT_RATE_MAX"); v != "" {
 		c.Cooldown.SoftRateMax = v
 	}
+	if v := os.Getenv("WB2A_RESET_HONOR_MAX"); v != "" {
+		c.Cooldown.ResetHonorMax = v
+	}
 	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Upstream.TimeoutSeconds = n
@@ -538,6 +553,17 @@ func (c *Config) normalize() error {
 	}
 	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
 		return fmt.Errorf("cooldown.soft_rate_max: %w", err)
+	}
+	// 空值回落默认 24h（同 soft_rate_max 的处理风格）。语义：上游重置墙钟的采信上限，
+	// 只拦荒谬时间；正常限流（几十分钟~几小时）一律按上游说的时刻锁。
+	if c.Cooldown.ResetHonorMax == "" {
+		c.Cooldown.ResetHonorMax = "24h"
+	}
+	if c.ResetHonorMaxDur, err = time.ParseDuration(c.Cooldown.ResetHonorMax); err != nil {
+		return fmt.Errorf("cooldown.reset_honor_max: %w", err)
+	}
+	if c.ResetHonorMaxDur <= 0 {
+		return fmt.Errorf("cooldown.reset_honor_max: 必须为正时长，得到 %q", c.Cooldown.ResetHonorMax)
 	}
 	if c.BreakerCooldownDur, err = time.ParseDuration(c.Pool.BreakerCooldown); err != nil {
 		return fmt.Errorf("pool.breaker_cooldown: %w", err)

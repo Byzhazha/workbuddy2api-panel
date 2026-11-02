@@ -200,10 +200,13 @@ const until = new Date(2026, 8, 28, 15, 0, 0).getTime();
 const rate = ctx.rateLimitMeta({ model: 'glm-5.3', kind: 'rate_limit', reset_at: new Date(reset).toISOString(), until: new Date(until).toISOString() }, now);
 const unavailable = ctx.rateLimitMeta({ model: 'missing', kind: 'model_unavailable', until: new Date(until).toISOString() }, now);
 const unknown = ctx.rateLimitMeta({ model: 'glm-5.3', kind: 'rate_limit' }, now);
+// 网关按 soft_rate_max 封顶提前放行、上游墙钟未到 → 必须写明「已放行」+ 上游恢复时刻。
+const probing = ctx.rateLimitMeta({ model: 'glm-5.3', kind: 'rate_limit', probing: true, gateway_cap_sec: 1, reset_at: new Date(reset).toISOString(), until: new Date(now).toISOString() }, now);
 process.stdout.write(JSON.stringify({
   rate: rate.detail,
   unavailable: unavailable.detail,
   unknown: unknown.detail,
+  probing: probing.detail,
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "rate-limit-format-*.cjs")
 	if err != nil {
@@ -217,8 +220,11 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("rate-limit formatting node test failed: %v\n%s", err, out)
 	}
-	// issue #171 问题二：until < resetAt 时主文字双时刻明示、倒计时跟随 until。
-	const want = `{"rate":"网关 2026-09-28 15:00 起重试（剩余 1时00分） · 上游称 2026-09-28 16:00 恢复","unavailable":"预计 1时00分 后重试","unknown":"预计解封时间未知"}`
+	// issue #171 问题二：until < resetAt（上游时间超出 reset_honor_max 上限）时主文字
+	// 双时刻明示、倒计时跟随 until。probing（网关提前放行、上游未恢复）必须自报
+	// 「网关已放行 + 上限 + 上游恢复时刻」——这是「日志一直 429、面板却说可用」那类
+	// 误判的展示修复点。
+	const want = `{"rate":"网关 2026-09-28 15:00 起重试（剩余 1时00分） · 上游称 2026-09-28 16:00 恢复","unavailable":"预计 1时00分 后重试","unknown":"预计解封时间未知","probing":"网关已放行（上限 1秒） · 上游称 2026-09-28 16:00 恢复"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("rate-limit formatting=%s want %s", out, want)
 	}
