@@ -44,6 +44,16 @@ type ModelLockRow struct {
 	UnlockAt time.Time `json:"unlock_at"`
 	// FullyUnlockAt 全部解锁时刻：最后一个被锁账号恢复的时刻。
 	FullyUnlockAt time.Time `json:"fully_unlock_at"`
+	// ResetAt 最早的上游「将在 … 重置」墙钟（多个号取最早者）。
+	// 面板「上游恢复」列直接显示这个绝对时刻——运维要的是「几点恢复」，不该让他
+	// 自己拿倒计时换算；上游没给时间（普通退避 / 11102 负缓存）时省略。
+	ResetAt time.Time `json:"reset_at,omitempty"`
+	// FullyResetAt 最晚的上游重置墙钟（全部号都恢复的时刻）。
+	FullyResetAt time.Time `json:"fully_reset_at,omitempty"`
+	// UntilAt 最早的**网关路由**放行时刻（min Until）。仅当它早于 ResetAt
+	// （上游时间超出 reset_honor_max 被截短）时输出：那时网关会先放行试探、但请求
+	// 仍会 429，面板需要同时给出「先放行」与「真恢复」两个时刻。
+	UntilAt time.Time `json:"until_at,omitempty"`
 	// Reason 该模型被锁的原因（取最早解锁账号的上游原文）。
 	Reason string `json:"reason,omitempty"`
 }
@@ -75,8 +85,11 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 	type agg struct {
 		locked      int       // 台账意义上的锁（displayUntil 未到）
 		probing     int       // 其中网关已放行、上游未恢复的（Until 已过）
-		unlockAt    time.Time // displayUntil 最早
+		unlockAt    time.Time // displayUntil 最早（真正值得重试的时刻）
 		fullyAt     time.Time // displayUntil 最晚
+		resetAt     time.Time // 上游重置墙钟最早
+		fullyReset  time.Time // 上游重置墙钟最晚
+		untilAt     time.Time // 网关路由放行最早（min Until）
 		reason      string
 	}
 	rows := make(map[string]*agg)
@@ -106,6 +119,21 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 			if mc.Until.IsZero() || !now.Before(mc.Until) {
 				a.probing++
 			}
+			// 两个绝对时刻（面板「上游恢复」列 + 「先放行/真恢复」双口径用）：
+			// 上游没给墙钟（普通退避 / 11102）时 ResetAt 零值 → 该列留空。
+			if !mc.ResetAt.IsZero() {
+				if a.resetAt.IsZero() || mc.ResetAt.Before(a.resetAt) {
+					a.resetAt = mc.ResetAt
+				}
+				if a.fullyReset.IsZero() || mc.ResetAt.After(a.fullyReset) {
+					a.fullyReset = mc.ResetAt
+				}
+			}
+			if !mc.Until.IsZero() {
+				if a.untilAt.IsZero() || mc.Until.Before(a.untilAt) {
+					a.untilAt = mc.Until
+				}
+			}
 			if a.unlockAt.IsZero() || displayUntil.Before(a.unlockAt) {
 				a.unlockAt = displayUntil
 				a.reason = mc.Reason
@@ -131,7 +159,13 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 			Probing:       a.probing,
 			UnlockAt:      a.unlockAt,
 			FullyUnlockAt: a.fullyAt,
+			ResetAt:       a.resetAt,
+			FullyResetAt:  a.fullyReset,
 			Reason:        a.reason,
+		}
+		// 只有「网关先放行、上游后恢复」时才透出 UntilAt（否则两个时刻相同，多一列噪音）。
+		if !a.untilAt.IsZero() && !a.resetAt.IsZero() && a.untilAt.Before(a.resetAt) {
+			row.UntilAt = a.untilAt
 		}
 		for _, e := range p.byUID {
 			if e.a.Realm() != realm {

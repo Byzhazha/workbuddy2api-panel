@@ -41,6 +41,51 @@ func TestModelLockViewEmpty(t *testing.T) {
 	}
 }
 
+// TestModelLockViewResetTimesExposed 面板「上游恢复」列要的是绝对时刻：
+// ResetAt/FullyResetAt 取上游墙钟的 min/max；UntilAt 只在「网关先放行、上游后恢复」
+// （上游时间被 reset_honor_max 截短）时透出，两者相同时不额外加噪音。
+func TestModelLockViewResetTimesExposed(t *testing.T) {
+	p := lockViewPool(t)
+	base := time.Now()
+	resetEarly := base.Add(time.Hour)
+	resetLate := base.Add(3 * time.Hour)
+	untilEarly := base.Add(30 * time.Minute)
+	p.mu.Lock()
+	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+		"glm-5.3": {Until: resetEarly, ResetAt: resetEarly, Reason: "6004 model rate limit"},
+	}
+	// u2：上游说 3h 后才恢复，但网关只锁 30m（reset_honor_max 截短）→ 先放行。
+	p.byUID["u2"].modelCooldowns = map[string]modelCooldown{
+		"glm-5.3": {Until: untilEarly, ResetAt: resetLate, Reason: "6004 model rate limit"},
+	}
+	p.mu.Unlock()
+
+	rows := p.ModelLockView()
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %+v", rows)
+	}
+	r := rows[0]
+	if !r.ResetAt.Equal(resetEarly) {
+		t.Errorf("reset_at = %v want 最早上游墙钟 %v", r.ResetAt, resetEarly)
+	}
+	if !r.FullyResetAt.Equal(resetLate) {
+		t.Errorf("fully_reset_at = %v want 最晚上游墙钟 %v", r.FullyResetAt, resetLate)
+	}
+	if !r.UntilAt.Equal(untilEarly) {
+		t.Errorf("until_at = %v want 网关最早放行 %v（早于上游 → 必须同时给出两个时刻）", r.UntilAt, untilEarly)
+	}
+
+	// 全部「until == resetAt」（正常情况：429 直接锁到上游时刻）→ 不输出 until_at。
+	p.mu.Lock()
+	p.byUID["u2"].modelCooldowns = map[string]modelCooldown{
+		"glm-5.3": {Until: resetLate, ResetAt: resetLate, Reason: "6004 model rate limit"},
+	}
+	p.mu.Unlock()
+	if r = p.ModelLockView()[0]; !r.UntilAt.IsZero() {
+		t.Errorf("until_at = %v want 零值（与 reset_at 相同，不重复展示）", r.UntilAt)
+	}
+}
+
 // TestModelLockViewPartial 部分号被锁 → partial，且带出可选/总数、最早解锁与原因。
 func TestModelLockViewPartial(t *testing.T) {
 	p := lockViewPool(t)
@@ -68,6 +113,10 @@ func TestModelLockViewPartial(t *testing.T) {
 	}
 	if !r.FullyUnlockAt.Equal(r.UnlockAt) {
 		t.Errorf("只有一个号被锁时 fully_unlock_at 应等于 unlock_at")
+	}
+	// 手搓的冷却只有 Until（上游没给墙钟）→ 「上游恢复」列应为空、也不额外报 until_at。
+	if !r.ResetAt.IsZero() || !r.FullyResetAt.IsZero() || !r.UntilAt.IsZero() {
+		t.Errorf("无上游墙钟时应留空 reset_at/fully_reset_at/until_at: %+v", r)
 	}
 }
 

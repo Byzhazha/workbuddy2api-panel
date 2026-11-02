@@ -484,14 +484,14 @@ function renderAccounts(list) {
   }).join('');
 }
 
-// renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
-// 后端 model_locks 已按「整池不可用 → 没号可用 → 部分限流」排好序，这里只做展示。
+// renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久、几点恢复。
+// 后端 model_locks 已按「整池不可用 → 没号可用 → 已放行·仍 429 → 部分限流」排好序，这里只做展示。
 function renderModelLocks(rows) {
   const tb = $('mlBody');
   if (!tb) return;
   const note = $('mlNote');
   if (!rows || !rows.length) {
-    tb.innerHTML = '<tr><td colspan="8"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>';
     if (note) note.textContent = '';
     return;
   }
@@ -500,18 +500,39 @@ function renderModelLocks(rows) {
     const ms = parseAPITime(iso);
     return ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '—';
   };
+  const at = iso => {
+    const ms = parseAPITime(iso);
+    return ms ? fmtLocalDateTime(ms) : '';
+  };
+  const sub = txt => txt ? '<div class="note" style="color:var(--ink-3)">' + esc(txt) + '</div>' : '';
   tb.innerHTML = rows.map(r => {
     const st = STATE[r.state] || ['mute', r.state || '—'];
     const realm = r.realm === 'global' ? '国际版' : '国内版';
+    // 「上游恢复」列：直接给绝对时刻（运维要的是「几点恢复」，不该自己拿倒计时换算）。
+    //   - reset_at：上游「将在 … 重置」的墙钟（最早的号）——这是真正的恢复时刻；
+    //   - fully_reset_at 更晚时补一行「全池」；
+    //   - until_at 存在 = 上游时间被 reset_honor_max 截短：网关会先放行试探，
+    //     但请求仍会 429，两个时刻一起写清楚。
+    const resetAt = at(r.reset_at);
+    const fullReset = at(r.fully_reset_at);
+    const untilAt = at(r.until_at);
+    let resetCell = resetAt ? esc(resetAt) : '—';
+    if (resetAt) {
+      if (fullReset && fullReset !== resetAt) resetCell += sub('全池 ' + fullReset);
+      if (untilAt) resetCell += sub('网关 ' + untilAt + ' 先放行');
+    } else {
+      resetCell = '<span style="color:var(--ink-3)">未给时间</span>';
+    }
     return '<tr>' +
       '<td>' + esc(r.model) + '</td>' +
       '<td><span class="realm-tag">' + realm + '</span></td>' +
       '<td><span class="tag ' + st[0] + '">' + st[1] + '</span></td>' +
       '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
       '<td class="num">' + (r.locked || 0) + (r.probing
-        ? '<div class="note" style="color:var(--ink-3)">其中 ' + r.probing + ' 已放行</div>' : '') + '</td>' +
+        ? sub('其中 ' + r.probing + ' 已放行') : '') + '</td>' +
       '<td class="num">' + left(r.unlock_at || r.fully_unlock_at) + '</td>' +
       '<td class="num">' + left(r.fully_unlock_at) + '</td>' +
+      '<td class="num">' + resetCell + '</td>' +
       '<td>' + (r.reason ? '<div class="note">' + esc(r.reason) + '</div>' : '—') + '</td>' +
       '</tr>';
   }).join('');
