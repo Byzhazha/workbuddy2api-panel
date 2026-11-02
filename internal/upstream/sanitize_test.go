@@ -293,6 +293,75 @@ func TestChatStreamWireBodySanitized(t *testing.T) {
 	}
 }
 
+// 真实故障：排查报告把 DSH 模板写进 assistant 历史后，替换 system 仍返回 400。
+// 验证实际出站请求同时处理系统规范与历史引用，并完整保留文件操作规则和用户问题。
+func TestChatStreamDeepSeekHarnessPromptAndHistory(t *testing.T) {
+	sections := []string{
+		"You are an AI agent powered by DeepSeek Harness.",
+		"Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.",
+		"You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to this page, they mean this GUI.",
+	}
+	const rules = "Read a file before editing it. If a file operation returns FS_STALE_VERSION, read the current file and retry."
+	var sent struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	ts := newTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+			t.Error(err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+	defer ts.Close()
+	c := New()
+	c.SanitizeFingerprints.Store(true)
+	c.ChatBaseCN = ts.URL
+	body, err := json.Marshal(map[string]any{
+		"model": "deepseek-v4.1-flash",
+		"messages": []map[string]string{
+			{"role": "system", "content": strings.Join(sections, "\n\n") + "\n\n" + rules},
+			{"role": "assistant", "content": "排查报告引用：\n" + strings.Join(sections, "\n")},
+			{"role": "user", "content": "你好，请继续对话"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, status, respBody, err := c.ChatStream(&auth.Auth{AccessToken: "test-token", Domain: "copilot.tencent.com", UID: "u1"}, body, "", ChatMeta{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	if status != http.StatusOK {
+		t.Fatalf("上游请求失败：%d %s", status, respBody)
+	}
+	if len(sent.Messages) != 3 {
+		t.Fatalf("消息数量发生变化：%d", len(sent.Messages))
+	}
+	for i, role := range []string{"system", "assistant"} {
+		msg := sent.Messages[i]
+		if msg.Role != role {
+			t.Errorf("第 %d 条消息角色发生变化：%s", i, msg.Role)
+		}
+		for _, section := range sections {
+			if strings.Contains(msg.Content, section) {
+				t.Errorf("%s 出站仍包含导致拦截的模板：%s", role, section)
+			}
+		}
+		for _, preserved := range []string{"DeepSeek Harness", "Relative paths resolve from the workspace root", "absolute paths identify files or directories on the host", "they mean this GUI"} {
+			if !strings.Contains(msg.Content, preserved) {
+				t.Errorf("%s 出站丢失原有说明：%s", role, preserved)
+			}
+		}
+	}
+	if !strings.Contains(sent.Messages[0].Content, rules) || sent.Messages[2].Content != "你好，请继续对话" {
+		t.Error("文件操作规则或用户问题发生变化")
+	}
+}
+
 // 出站边界（Codex 场景）：CPA 把 instructions 折成 role=system 的首条消息，
 // 净化后 wire body 不得残留 Codex 逐字指纹；其余消息不受影响。
 func TestChatStreamWireBodyCodexInstructionsSanitized(t *testing.T) {

@@ -17,9 +17,12 @@ var sanitizeFeatures = []string{
 	"cc_entrypoint=",             // 尾随裸键值（截断前缀即可命中）
 	"You are Claude Code",        // 身份句（截断前缀即可命中）
 	"Main branch (",              // 注入指令句（截断前缀即可命中）
-	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
-	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
-	"11128",                                           // 上游反探测：裸数字错误码
+	"You are a coding agent running in the Codex CLI",                        // Codex instructions 首段（截断前缀即可命中）
+	"You are an AI agent powered by DeepSeek Harness",                        // DSH 身份说明与历史引用
+	"Tokens prefixed with @",                                                 // DSH 文件引用说明
+	"You are interacting with the user through the DeepSeek Harness Web GUI", // DSH 界面说明
+	"github.com/anthropics/",                                                 // 反馈句里的 Anthropic 仓库链接
+	"11128",                                                                  // 上游反探测：裸数字错误码
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -48,6 +51,20 @@ var sanitizeKvRe = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
 // 注意仍要求 "You are Claude Code, " 前缀，不做更宽的子串替换，
 // 以免误伤 TestExactMatchOnlyVariantNotTouched 所保护的零散文本。
 var sanitizeRewrites = [][2]string{
+	// DSH 模板也可能由排查报告写入 assistant 历史；统一按文本处理，
+	// 让后续轮次保留工具规范与上下文，避免仅替换 system 后历史引用仍被拦截。
+	{
+		"You are an AI agent powered by DeepSeek Harness",
+		"You are an AI agent, powered by DeepSeek Harness",
+	},
+	{
+		"Tokens prefixed with @",
+		"Tokens starting with @",
+	},
+	{
+		"You are interacting with the user through the DeepSeek Harness Web GUI",
+		"You are communicating with the user through the DeepSeek Harness Web GUI",
+	},
 	{
 		"You are Claude Code, Anthropic's official CLI for Claude",
 		"You are Claude Code, Anthropic's official CLI tool for Claude",
