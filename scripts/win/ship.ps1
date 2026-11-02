@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  一条命令发货：提交 → 测试 → 编译 → canary → 替换 → 空闲重启 → 自检。
+  一条命令发货：提交 → 测试 → 编译 → canary → 替换 → 空闲重启 → 自检 → 推送。
 
 .DESCRIPTION
   这是本仓库在 Windows 上的**唯一部署入口**。改完代码就运行它，不要人工手工部署：
@@ -17,6 +17,8 @@
                        完成替换（不停服务）→ 等 in_flight 连续为 0 → 停/起 →
                        健康检查 → 起不来自动回滚。
     4. verify.ps1      校验「自启项 → 磁盘文件 → 运行进程」三者一致，退出码即结论。
+    5. 推送            把当前分支推到 fork（无 fork 则 origin），-NoPush 可跳过。
+                       推送失败只告警、不改本次发货结论（部署已生效，远端权限/网络可后补）。
 
   为什么可以在这个会话里跑（实测 2026-11-01 21:33）：工具调用发生在两次模型请求
   之间，deploy 又会先等 in_flight=0 才动手，所以重启落在请求间隙里，会话不受影响；
@@ -40,7 +42,8 @@ param(
   [string]$Commit,
   [switch]$SkipTests,
   [switch]$NoDeploy,
-  [switch]$NoRestart
+  [switch]$NoRestart,
+  [switch]$NoPush
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,6 +52,23 @@ $Root = (Resolve-Path $Root).Path
 Push-Location $Root
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 function Step([string]$m) { Write-Host "`n── $m ──" -ForegroundColor Cyan }
+
+# 推送到远端：优先 fork（本仓库的 origin 是上游，通常只读），没有 fork 才用 origin。
+# 失败只告警——部署/自检已经完成，推送属于最后一步的留痕，不该反过来把发货判成失败。
+function Invoke-Push {
+  if ($NoPush) { Write-Host '  已指定 -NoPush：跳过推送' -ForegroundColor Yellow; return }
+  $remotes = @(& git remote)
+  $remote = if ($remotes -contains 'fork') { 'fork' } elseif ($remotes -contains 'origin') { 'origin' } else { $null }
+  if (-not $remote) { Write-Host '  仓库没有任何 remote，跳过推送' -ForegroundColor Yellow; return }
+  $branch = (& git rev-parse --abbrev-ref HEAD).Trim()
+  Step "推送 → $remote/$branch"
+  $pushOut = & git push -u $remote $branch 2>&1
+  $pushExit = $LASTEXITCODE
+  $pushOut | ForEach-Object { Write-Host "  $_" }
+  if ($pushExit -ne 0) {
+    Write-Host "  推送失败（不影响本次发货结论）：检查 $remote 权限或网络，可稍后手动 git push $remote $branch" -ForegroundColor Yellow
+  }
+}
 
 try {
   # ---- 1. 提交 --------------------------------------------------------------
@@ -80,6 +100,7 @@ try {
   }
 
   if ($NoDeploy) {
+    Invoke-Push
     Write-Host "`n仅测试模式：未部署。用时 $([int]$sw.Elapsed.TotalSeconds)s" -ForegroundColor Yellow
     exit 0
   }
@@ -99,6 +120,9 @@ try {
   Step '自检（自启 / 文件 / 进程 三者一致）'
   & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'verify.ps1') -Root $Root 2>&1 | ForEach-Object { Write-Host "  $_" }
   $verifyExit = $LASTEXITCODE
+
+  # ---- 5. 推送 --------------------------------------------------------------
+  Invoke-Push
 
   $sha = (& git rev-parse --short HEAD)
   Write-Host ''
