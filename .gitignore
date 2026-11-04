@@ -57,3 +57,8 @@ server.exe
 # 版本化构建产物与部署日志（scripts/win/*.ps1 的产出）
 /bin/
 /logs/
+
+# 服务器部署数据目录（账号凭证 + 运行数据 + 配置，见 compose.server.yml）
+/runtime/
+# 本地同步/备份中转
+/scripts/tmp/

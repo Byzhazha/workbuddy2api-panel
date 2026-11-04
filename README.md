@@ -923,6 +923,56 @@ http://127.0.0.1:7863/panel/
 
 账号 / 数据通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`、`./config.json`。
 
+### 云端服务器（Linux / Docker）：一条命令 + 自动监听
+
+生产环境：`root@38.76.219.235:3012`，仓库在 `/opt/workbuddy2api-panel`，编排用
+`compose.server.yml`（**源码构建**，不再依赖 GHCR 上游镜像；`./runtime` 整目录挂载），
+nginx 反代 `https://wkapi.jaycode.online` → `127.0.0.1:7863`。
+
+代码与数据走两条链路，互不混用：
+
+| 内容 | 通道 | 命令 |
+|---|---|---|
+| 代码（git 跟踪的一切） | GitHub fork → 服务器 `git pull` + `docker build` | `ship-cloud.ps1` |
+| 账号 + data + config（含凭证，已被 gitignore） | 本地打包 scp → 服务器 `runtime/` | `sync-data.ps1` |
+
+```powershell
+# 常规发布：提交 → vet/test → push fork → 服务器构建替换 → 健康检查 → 自检
+pwsh -File scripts\win\ship-cloud.ps1 -Commit "feat(panel): xxx"
+
+# 代码 + 账号/数据一起同步（服务器最终与本地 4 个账号、用量完全一致）
+pwsh -File scripts\win\ship-cloud.ps1 -Commit "..." -SyncData
+
+# 只同步数据（不发版）
+pwsh -File scripts\win\sync-data.ps1
+
+# 自动模式：本地保存后防抖 8s 自动发布，Ctrl+C 停止
+pwsh -File scripts\win\watch-cloud.ps1
+```
+
+服务器侧脚本（也可直接 ssh 进去跑）：
+
+- `bash scripts/linux/deploy.sh` —— fetch/reset（只动代码，不碰 `runtime/`）→
+  `docker build --label wb2api.commit=<完整 sha>` → `docker compose up -d` →
+  90s 健康检查。容器已在跑同一提交且健康则跳过构建；构建/启动失败自动回滚到
+  `workbuddy2api-panel:rollback` 镜像，线上保持上一版。
+- `bash scripts/linux/apply-sync.sh /tmp/wb2api-sync.tgz` —— 先备份
+  `runtime/` 到 `/root/backups/wb2api-runtime-<ts>-pre-sync.tar.gz`，再停容器 →
+  原子替换 `auths/`、`data/`、`config.json` → `chown 10001:10001` → 拉起 → 健康检查。
+- `bash scripts/linux/status.sh` —— 输出仓库 sha、镜像标签、容器状态、
+  本地/公网 `/healthz`、账号文件数。
+
+注意事项：
+
+- 服务器 `runtime/config.json` 的 `listen` 必须是 `:7863`（`sync-data.ps1` 会自动改写）；
+  容器内绑 `127.0.0.1:7863` 时端口映射连不进去。
+- `runtime/`、`bin/`、`backups/`、`logs/` 已进 `.gitignore` / `.dockerignore`，
+  凭证既不会进 git 也不会进镜像层。
+- 本地与服务器**同时**跑同一批账号时，token 刷新存在互相顶掉的可能；日常以一边为主
+  （改代码在本地、对外服务在服务器）。
+- 手工回滚：`docker tag workbuddy2api-panel:rollback workbuddy2api-panel:local &&
+  docker compose -f compose.server.yml up -d --force-recreate --no-build`
+
 ### 工具脚本
 
 | 脚本 | 用途 |

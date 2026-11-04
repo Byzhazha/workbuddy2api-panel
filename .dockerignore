@@ -12,6 +12,13 @@ scripts/__pycache__/
 /signin_bin
 # 真实配置不进镜像（镜像默认用 config.example.json，生产以挂载卷覆盖）
 config.json
+# 服务器部署数据（账号凭证/运行数据/配置）与部署产物绝不进构建上下文
+/runtime/
+/bin/
+/logs/
+/backups/
+/wb2api.exe*
+*.exe
 PLAN.md
 SPEC.md
 LOOP.md

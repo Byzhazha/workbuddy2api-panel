@@ -1,0 +1,32 @@
+# 生产服务器（Linux + Docker）专用编排：源码构建 + runtime 整目录挂载。
+#
+# 与根目录 docker-compose.yml 的区别：
+#   - 由服务器本地 `docker build` 出镜像（不再依赖 GHCR 上游镜像），代码版本 = git 提交；
+#   - 账号 / 数据 / 配置统一挂在 ./runtime（compose 文件与数据都在同一台机器，便于备份）；
+#   - 端口只绑 127.0.0.1，由 nginx 反代到 https://wkapi.jaycode.online。
+#
+# 日常不要手工 `docker compose up`：用 scripts/linux/deploy.sh（或本地 ship-cloud.ps1），
+# 它会打 wb2api.commit 标签、跑健康检查、失败自动回滚。
+services:
+  wb2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: workbuddy2api-panel:local
+    container_name: workbuddy2api
+    restart: unless-stopped
+    user: "10001:10001"
+    working_dir: /app/runtime
+    entrypoint: ["/app/wb2api", "-config", "/app/runtime/config.json"]
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:7863:7863"
+    # 整目录挂载使配置页可以原子替换文件，账号和历史数据统一持久保存。
+    volumes:
+      - ./runtime:/app/runtime
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
