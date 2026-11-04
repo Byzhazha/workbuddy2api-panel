@@ -95,6 +95,12 @@ try {
     Step "推送 → $Remote/$Branch"
     & git push -u $Remote $Branch
     if ($LASTEXITCODE -ne 0) {
+      # GitHub 偶发对「更新已有分支」返回 500（新建分支正常），用 force-with-lease 重试一次：
+      # 这是自己的部署分支，远端若被别人推进过 lease 会拒绝，同样安全。
+      Write-Host '  普通推送失败，用 --force-with-lease 重试一次…' -ForegroundColor Yellow
+      & git push --force-with-lease -u $Remote $Branch
+    }
+    if ($LASTEXITCODE -ne 0) {
       Write-Host "推送失败，中止（服务器拿不到新提交）" -ForegroundColor Red
       exit 7
     }
