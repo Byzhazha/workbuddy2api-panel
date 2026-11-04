@@ -128,13 +128,21 @@ try {
   }
 
   # —— 6. 自检 ————————————————————————————————————————————————————————
+  # 容器 HEALTHCHECK 是 30s 间隔 + 5s 启动宽限，刚拉起时状态是 starting；
+  # 这里轮询到 healthy（最长 90s）再下结论，避免把「还没跑第一次检查」误判成失败。
   Step '自检（服务器 git sha / 容器 / 公网可达 / 账号数）'
-  $statusOut = & ssh -p $Port $Server "bash $RemoteDir/scripts/linux/status.sh" 2>&1
   $map = @{}
-  foreach ($line in $statusOut) {
-    if ($line -match '^([a-z_]+)=(.*)$') { $map[$Matches[1]] = $Matches[2] }
-    Write-Host "  $line"
-  }
+  $deadline = (Get-Date).AddSeconds(90)
+  do {
+    $statusOut = & ssh -p $Port $Server "bash $RemoteDir/scripts/linux/status.sh" 2>&1
+    $map = @{}
+    foreach ($line in $statusOut) {
+      if ($line -match '^([a-z_]+)=(.*)$') { $map[$Matches[1]] = $Matches[2] }
+    }
+    if ($map['container'] -match '^running/healthy') { break }
+    Start-Sleep -Seconds 3
+  } while ((Get-Date) -lt $deadline)
+  foreach ($line in $statusOut) { Write-Host "  $line" }
 
   $problems = @()
   if ($map['repo_commit'] -ne $sha) { $problems += "服务器代码 $($map['repo_commit']) ≠ 本地 $sha" }

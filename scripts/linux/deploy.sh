@@ -110,6 +110,8 @@ fi
 if wait_healthy; then
   log "健康检查通过：$(curl -fsS -m 3 "$HEALTH_URL")"
   log "容器：$(docker inspect "$CONTAINER" --format '{{.State.Status}}/{{.State.Health.Status}}' 2>/dev/null || echo unknown)"
+  # 每次部署都会产生一个悬空镜像（:local 标签被新镜像占用），只清 3 天前的悬空层，留回滚镜像
+  docker image prune -f --filter "until=72h" >/dev/null 2>&1 || true
   log "== 部署完成：$SHORT =="
   exit 0
 fi

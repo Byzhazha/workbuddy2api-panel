@@ -970,6 +970,8 @@ pwsh -File scripts\win\watch-cloud.ps1
   凭证既不会进 git 也不会进镜像层。
 - 本地与服务器**同时**跑同一批账号时，token 刷新存在互相顶掉的可能；日常以一边为主
   （改代码在本地、对外服务在服务器）。
+- 首次部署要先拉 `golang:1.23-alpine` 并下载 Go 模块（约 10 分钟）；之后每次重建只重跑
+  `go build`，通常 1~2 分钟。构建在服务器上做，本机不需要 Docker。
 - 手工回滚：`docker tag workbuddy2api-panel:rollback workbuddy2api-panel:local &&
   docker compose -f compose.server.yml up -d --force-recreate --no-build`
 

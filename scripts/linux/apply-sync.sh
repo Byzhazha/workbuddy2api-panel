@@ -49,7 +49,10 @@ chown -R 10001:10001 runtime/auths runtime/data runtime/config.json
 chmod 700 runtime/auths runtime/data
 find runtime/auths runtime/data -maxdepth 1 -type f -name '*.json' -exec chmod 600 {} +
 chmod 600 runtime/config.json
-[ -d runtime/data/request-logs ] && chmod 755 runtime/data/request-logs
+if [ -d runtime/data/request-logs ]; then
+  chmod 755 runtime/data/request-logs
+  find runtime/data/request-logs -type f -exec chmod 644 {} +
+fi
 
 log "拉起容器"
 docker compose -f "$COMPOSE" up -d --force-recreate --no-build >/dev/null
