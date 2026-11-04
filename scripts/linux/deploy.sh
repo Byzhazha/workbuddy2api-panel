@@ -52,6 +52,17 @@ SHA="$(git rev-parse HEAD)"
 SHORT="$(git rev-parse --short HEAD)"
 log "代码就位：$SHORT $(git log -1 --format='%s')"
 
+# 单实例模式（本机为主）下，服务器 127.0.0.1:7863 被 SSH 反向隧道占着。
+# 这时构建完也起不来容器（端口冲突），提前拦下，别白白等一轮构建。
+PORT_HOLDER="$(ss -ltnp 2>/dev/null | grep ':7863' | head -n 1 || true)"
+if printf '%s' "$PORT_HOLDER" | grep -q 'sshd'; then
+  log "ERROR: 127.0.0.1:7863 正被 SSH 反向隧道占用（当前是本机单实例模式）。"
+  log "      要更新服务器上的代码，请先切到服务器模式："
+  log "        pwsh -File scripts\\win\\mode.ps1 -Mode Server"
+  log "      然后重新执行发布。"
+  exit 2
+fi
+
 # —— 已在运行同一提交且健康 → 无事可做 ————————————————————————————————
 RUNNING_SHA="$(docker inspect "$CONTAINER" --format '{{index .Config.Labels "wb2api.commit"}}' 2>/dev/null || true)"
 RUNNING_STATE="$(docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null || true)"

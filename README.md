@@ -923,13 +923,54 @@ http://127.0.0.1:7863/panel/
 
 账号 / 数据通过 `docker-compose.yml` 卷挂载持久化：`./auths`、`./data`、`./config.json`。
 
-### 云端服务器（Linux / Docker）：一条命令 + 自动监听
+### 云端入口与两种运行模式
 
-生产环境：`root@38.76.219.235:3012`，仓库在 `/opt/workbuddy2api-panel`，编排用
-`compose.server.yml`（**源码构建**，不再依赖 GHCR 上游镜像；`./runtime` 整目录挂载），
-nginx 反代 `https://wkapi.jaycode.online` → `127.0.0.1:7863`。
+生产入口：`https://wkapi.jaycode.online` → 服务器 nginx → `127.0.0.1:7863`。
+服务器 `root@38.76.219.235:3012`，仓库在 `/opt/workbuddy2api-panel`。
 
-代码与数据走两条链路，互不混用：
+#### 默认模式：本机单实例 + 服务器反向隧道（推荐）
+
+```
+公网 → 服务器 nginx → 127.0.0.1:7863（sshd）→ SSH -R 隧道 → 本机 127.0.0.1:7863
+```
+
+全局只有一个 wb2api 进程：账号、余额、逐请求用量、请求日志、冷却/禁用状态都只有
+一份（在本机 `data/`），所以**不需要任何数据同步，也不存在两边各算各的**。服务器上的
+容器停着当待机副本，数据目录 `runtime/` 原样保留。
+
+为什么不做「两边都跑 + 定时同步」：`state.json` / `usage.json` 是本地文件，两个进程同时
+写只能靠覆盖；`upstash` 那套是**启动恢复快照**（两个实例每 5 秒互相覆盖），不是实时
+共享状态。要真正一致只能单实例（或改成共享数据库，成本大得多）。
+
+```powershell
+# 已注册计划任务 wb2api-tunnel（登录时自启），手动拉起/重启：
+schtasks /Run /TN wb2api-tunnel
+# 前台手动跑（Ctrl+C 停）：ssh -N -R 127.0.0.1:7863:127.0.0.1:7863
+pwsh -File scripts\win\tunnel.ps1
+# 隧道日志（断线原因、重连记录）
+Get-Content logs\tunnel.log -Tail 20
+```
+
+隧道断开后 5 秒自动重连，笔记本休眠唤醒也会重连。代价：**本机关机/断网时公网 502**。
+需要 7×24 在线就切到服务器模式。
+
+#### 备用模式：服务器自己跑
+
+切过去会把本地账号与数据同步到服务器，再由服务器对外服务（本机可关机）。切回来时
+本地数据不会被覆盖（本地始终是主），服务器期间产生的用量记录留在服务器 `runtime/` 里。
+
+```powershell
+# 切到服务器直跑（同步数据 → 拉起容器 → 验证公网）
+pwsh -File scripts\win\mode.ps1 -Mode Server
+# 顺便把最新代码发布上去（服务器镜像还停在旧提交时用，构建约 10 分钟）
+pwsh -File scripts\win\mode.ps1 -Mode Server -Deploy
+# 切回本机单实例
+pwsh -File scripts\win\mode.ps1 -Mode Local
+```
+
+两种模式不能同时跑（都占服务器 `127.0.0.1:7863`），`mode.ps1` 会先停另一边。
+
+服务器模式下的发版/同步链路（代码与数据分开走）：
 
 | 内容 | 通道 | 命令 |
 |---|---|---|
@@ -940,7 +981,7 @@ nginx 反代 `https://wkapi.jaycode.online` → `127.0.0.1:7863`。
 # 常规发布：提交 → vet/test → push fork → 服务器构建替换 → 健康检查 → 自检
 pwsh -File scripts\win\ship-cloud.ps1 -Commit "feat(panel): xxx"
 
-# 代码 + 账号/数据一起同步（服务器最终与本地 4 个账号、用量完全一致）
+# 代码 + 账号/数据一起同步
 pwsh -File scripts\win\ship-cloud.ps1 -Commit "..." -SyncData
 
 # 只同步数据（不发版）
@@ -955,7 +996,8 @@ pwsh -File scripts\win\watch-cloud.ps1
 - `bash scripts/linux/deploy.sh` —— fetch/reset（只动代码，不碰 `runtime/`）→
   `docker build --label wb2api.commit=<完整 sha>` → `docker compose up -d` →
   90s 健康检查。容器已在跑同一提交且健康则跳过构建；构建/启动失败自动回滚到
-  `workbuddy2api-panel:rollback` 镜像，线上保持上一版。
+  `workbuddy2api-panel:rollback` 镜像，线上保持上一版。**在隧道模式下会被端口占用
+  拦住并提示先切模式**（7863 被 sshd 占着，容器起不来）。
 - `bash scripts/linux/apply-sync.sh /tmp/wb2api-sync.tgz` —— 先备份
   `runtime/` 到 `/root/backups/wb2api-runtime-<ts>-pre-sync.tar.gz`，再停容器 →
   原子替换 `auths/`、`data/`、`config.json` → `chown 10001:10001` → 拉起 → 健康检查。
@@ -968,8 +1010,6 @@ pwsh -File scripts\win\watch-cloud.ps1
   容器内绑 `127.0.0.1:7863` 时端口映射连不进去。
 - `runtime/`、`bin/`、`backups/`、`logs/` 已进 `.gitignore` / `.dockerignore`，
   凭证既不会进 git 也不会进镜像层。
-- 本地与服务器**同时**跑同一批账号时，token 刷新存在互相顶掉的可能；日常以一边为主
-  （改代码在本地、对外服务在服务器）。
 - 首次部署要先拉 `golang:1.23-alpine` 并下载 Go 模块（约 10 分钟）；之后每次重建只重跑
   `go build`。构建在服务器上做（本机不需要 Docker），耗时随该机负载浮动——这台机器还跑着
   MySQL / RabbitMQ / Java，实测单次 10 分钟量级，挑空闲时段发布更稳。
