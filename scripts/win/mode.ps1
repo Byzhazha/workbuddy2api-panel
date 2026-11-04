@@ -57,6 +57,8 @@ if ($Mode -eq 'Server') {
   # —— 1. 停隧道，让出服务器 7863 ————————————————————————————————
   Step '停止本机隧道'
   & schtasks /End /TN $taskName 2>&1 | Out-Null
+  # 切到服务器模式后隧道任务必须禁用，否则下次登录它会自动拉起并和容器抢 7863。
+  & schtasks /Change /TN $taskName /DISABLE 2>&1 | Out-Null
   # /End 只结束计划任务进程，ssh 子进程可能还活着并占着服务器端口，这里一并清掉。
   Get-CimInstance Win32_Process -Filter "Name='ssh.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like '*127.0.0.1:7863:127.0.0.1:7863*' } |
@@ -96,6 +98,7 @@ Step '停止服务器实例（保留镜像与数据，作为待机副本）'
 Remote 'docker update --restart=no workbuddy2api && docker stop workbuddy2api 2>/dev/null; ss -ltnp 2>/dev/null | grep ":7863" || echo "7863 已让出"' 2>&1 | Write-Host
 
 Step '启动本机隧道（服务器 127.0.0.1:7863 → 本机 127.0.0.1:7863）'
+& schtasks /Change /TN $taskName /ENABLE 2>&1 | Out-Null
 & schtasks /Run /TN $taskName 2>&1 | Out-Null
 
 if (-not $NoVerify) { Step '验证公网'; if (-not (Wait-Public)) { Write-Host '  检查 logs\tunnel.log 与 schtasks /Query /TN wb2api-tunnel' -ForegroundColor Yellow; exit 1 } }
